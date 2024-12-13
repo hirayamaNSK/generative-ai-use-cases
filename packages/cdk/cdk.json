@@ -23,22 +23,26 @@
     "kendraIndexScheduleEnabled": false,
     "kendraIndexScheduleCreateCron": null,
     "kendraIndexScheduleDeleteCron": null,
-    "ragKnowledgeBaseEnabled": false,
+    "ragKnowledgeBaseEnabled": true,
     "ragKnowledgeBaseStandbyReplicas": false,
     "ragKnowledgeBaseAdvancedParsing": false,
     "ragKnowledgeBaseAdvancedParsingModelId": "anthropic.claude-3-sonnet-20240229-v1:0",
     "embeddingModelId": "amazon.titan-embed-text-v2:0",
     "selfSignUpEnabled": true,
-    "allowedSignUpEmailDomains": null,
+    "allowedSignUpEmailDomains": ["nsk.com"],
     "samlAuthEnabled": false,
     "samlCognitoDomainName": "",
     "samlCognitoFederatedIdentityProviderName": "",
     "modelRegion": "us-east-1",
     "modelIds": [
-      "anthropic.claude-3-sonnet-20240229-v1:0"
+      "anthropic.claude-3-5-sonnet-20240620-v1:0",
+      "amazon.nova-micro-v1:0",
+      "anthropic.claude-3-sonnet-20240229-v1:0",
+      "anthropic.claude-3-haiku-20240307-v1:0"
     ],
     "imageGenerationModelIds": [
-      "stability.stable-diffusion-xl-v1"
+      "stability.stable-diffusion-xl-v1",
+      "amazon.titan-image-generator-v2:0"
     ],
     "endpointNames": [],
     "agentEnabled": false,
@@ -47,8 +51,8 @@
     "searchApiKey": "",
     "agents": [],
     "promptFlows": [],
-    "allowedIpV4AddressRanges": null,
-    "allowedIpV6AddressRanges": null,
+    "allowedIpV4AddressRanges": ["126.144.19.52/32","126.144.19.52/32"],
+    "allowedIpV6AddressRanges": ["2002:7e90:1334::/128","2002:7e90:1334::/128"],
     "allowedCountryCodes": null,
     "hostName": null,
     "domainName": null,
