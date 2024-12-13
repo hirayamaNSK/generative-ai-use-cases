@@ -58,14 +58,21 @@ export type UploadedFileType = {
   s3Url?: string;
   uploading: boolean;
   deleting?: boolean;
+  errorMessages: string[];
 };
 
 export type FileLimit = {
-  accept: string[];
+  accept: {
+    doc: string[];
+    image: string[];
+    video: string[];
+  };
   maxFileCount: number;
   maxFileSizeMB: number;
   maxImageFileCount: number;
   maxImageFileSizeMB: number;
+  maxVideoFileCount: number;
+  maxVideoFileSizeMB: number;
 };
 
 export type RecordedMessage = PrimaryKey &

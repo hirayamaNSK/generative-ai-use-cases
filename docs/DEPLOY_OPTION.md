@@ -213,12 +213,11 @@ Agent チャットユースケースでは、以下のご利用が可能です�
 
 #### Code Interpreter エージェントのデプロイ
 
-Code Interpreter を利用したデータの可視化、コード実行、データ分析などが実行できます。  
-[詳細な手順はこちら](AGENTS_CODE_INTERPRETER.md)を参照してください。この章では、変更手順の概要を記載します。  
+Code Interpreter を利用したデータの可視化、コード実行、データ分析などが実行できます。
 
-AWSマネジメントコンソール画面で、Code Interpreter 機能を有効にした Agent を作成します。  
+Code Interpreter エージェントは Agent を有効化するとデプロイされます。
 
-作成された Agent で Alias を作成し、`agentId` と `aliasId` をコピーし、`cdk.json` に以下の形式で追加します。`displayName` は UI に表示したい名称を設定してください。また、context の `agentEnabled` を True にし、`agentRegion` は Agent を作成したリージョンを指定します。`npm run cdk:deploy` で再度デプロイして反映させます。
+context の `agentEnabled` に `true` を指定し(デフォルトは `false`)、`agentRegion` は [Agent for Bedrock が利用できるリージョン](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-supported.html) から指定します。
 
 **[packages/cdk/cdk.json](/packages/cdk/cdk.json) を編集**
 ```
@@ -226,13 +225,6 @@ AWSマネジメントコンソール画面で、Code Interpreter 機能を有効
   "context": {
     "agentEnabled": true,
     "agentRegion": "us-west-2",
-    "agents": [
-      {
-        "displayName": "Code Interpreter",
-        "agentId": "XXXXXXXXX",
-        "aliasId": "YYYYYYYY"
-      }
-    ],
   }
 }
 ```
@@ -379,6 +371,8 @@ PromptFlow チャットユースケースでは、作成済みの Prompt Flow �
 "apac.anthropic.claude-3-5-sonnet-20240620-v1:0",
 "us.meta.llama3-2-90b-instruct-v1:0",
 "us.meta.llama3-2-11b-instruct-v1:0",
+"amazon.nova-pro-v1:0",
+"amazon.nova-lite-v1:0"
 ```
 
 これらのいずれかが `cdk.json` の `modelIds` に定義されている必要があります。
@@ -403,6 +397,8 @@ PromptFlow チャットユースケースでは、作成済みの Prompt Flow �
     "apac.anthropic.claude-3-5-sonnet-20240620-v1:0",
     "us.meta.llama3-2-90b-instruct-v1:0",
     "us.meta.llama3-2-11b-instruct-v1:0",
+    "amazon.nova-pro-v1:0",
+    "amazon.nova-lite-v1:0",
   ]
 ```
 
@@ -415,20 +411,18 @@ PromptFlow チャットユースケースでは、作成済みの Prompt Flow �
 
 Prompt optimization のサポート状況は [こちら](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-management-optimize.html) をご参照ください。
 
-## ユースケースビルダーの有効化
+## ユースケースビルダーの設定
 
-context の `useCaseBuilderEnabled` に `true` を指定します。(デフォルトは `false`)
+ユースケースビルダーはデフォルトで有効化されており、デプロイ後画面上に表示される「ビルダーモード」という項目から利用できます。ユースケースビルダーを無効化する場合は、context の `useCaseBuilderEnabled` に `false` を指定します。(デフォルトは `true`)
 
 **[packages/cdk/cdk.json](/packages/cdk/cdk.json) を編集**
 ```
 {
   "context": {
-    "useCaseBuilderEnabled": true
+    "useCaseBuilderEnabled": false
   }
 }
 ```
-
-変更後に `npm run cdk:deploy` で再度デプロイすると、ユースケースビルダーが有効化されて画面上に「ビルダーモード」という項目が表示されるようになります。
 
 ## Amazon Bedrock のモデルを変更する
 
@@ -478,7 +472,13 @@ context の `useCaseBuilderEnabled` に `true` を指定します。(デフォ�
 "anthropic.claude-v2",
 "anthropic.claude-instant-v1",
 "mistral.mixtral-8x7b-instruct-v0:1",
-"mistral.mistral-7b-instruct-v0:2"
+"mistral.mistral-7b-instruct-v0:2",
+"amazon.nova-pro-v1:0",
+"amazon.nova-lite-v1:0",
+"amazon.nova-micro-v1:0",
+"us.amazon.nova-pro-v1:0",
+"us.amazon.nova-lite-v1:0",
+"us.amazon.nova-micro-v1:0"
 ```
 
 
@@ -503,6 +503,9 @@ context の `useCaseBuilderEnabled` に `true` を指定します。(デフォ�
     "anthropic.claude-3-5-sonnet-20240620-v1:0",
     "anthropic.claude-3-sonnet-20240229-v1:0",
     "anthropic.claude-3-haiku-20240307-v1:0",
+    "amazon.nova-pro-v1:0",
+    "amazon.nova-lite-v1:0",
+    "amazon.nova-micro-v1:0",
     "amazon.titan-text-premier-v1:0",
     "meta.llama3-70b-instruct-v1:0",
     "meta.llama3-8b-instruct-v1:0",
@@ -513,6 +516,7 @@ context の `useCaseBuilderEnabled` に `true` を指定します。(デフォ�
   "imageGenerationModelIds": [
     "amazon.titan-image-generator-v2:0",
     "amazon.titan-image-generator-v1",
+    "amazon.nova-canvas-v1:0",
     "stability.stable-diffusion-xl-v1"
   ],
 ```
@@ -557,9 +561,15 @@ context の `useCaseBuilderEnabled` に `true` を指定します。(デフォ�
     "us.meta.llama3-2-11b-instruct-v1:0",
     "us.meta.llama3-2-3b-instruct-v1:0",
     "us.meta.llama3-2-1b-instruct-v1:0",
+    "us.amazon.nova-pro-v1:0",
+    "us.amazon.nova-lite-v1:0",
+    "us.amazon.nova-micro-v1:0",
     "cohere.command-r-plus-v1:0",
     "cohere.command-r-v1:0",
-    "mistral.mistral-large-2407-v1:0"
+    "mistral.mistral-large-2407-v1:0",
+    "us.amazon.nova-pro-v1:0",
+    "us.amazon.nova-lite-v1:0",
+    "us.amazon.nova-micro-v1:0"
   ],
   "imageGenerationModelIds": [
     "amazon.titan-image-generator-v2:0",

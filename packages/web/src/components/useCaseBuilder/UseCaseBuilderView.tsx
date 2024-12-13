@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Select from '../Select';
 import Button from '../Button';
 import useChat from '../../hooks/useChat';
@@ -20,7 +20,14 @@ import {
   NOLABEL,
   extractPlaceholdersFromPromptTemplate,
   getItemsFromPlaceholders,
+  getTextFormItemsFromItems,
 } from '../../utils/UseCaseBuilderUtils';
+import useRagKnowledgeBaseApi from '../../hooks/useRagKnowledgeBaseApi';
+import useRagApi from '../../hooks/useRagApi';
+
+const ragEnabled: boolean = import.meta.env.VITE_APP_RAG_ENABLED === 'true';
+const ragKnowledgeBaseEnabled: boolean =
+  import.meta.env.VITE_APP_RAG_KNOWLEDGE_BASE_ENABLED === 'true';
 
 type Props = {
   modelId?: string;
@@ -28,6 +35,7 @@ type Props = {
   promptTemplate: string;
   description?: string;
   inputExamples?: UseCaseInputExample[];
+  fixedModelId: string;
   isLoading?: boolean;
 } & (
   | {
@@ -89,14 +97,24 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     getModelId,
     setModelId,
     loading,
+    setLoading,
     messages,
     postChat,
     clear: clearChat,
   } = useChat(pathname);
-  const modelId = getModelId();
+  const modelId = useMemo(() => {
+    if (props.fixedModelId !== '') {
+      return props.fixedModelId;
+    } else {
+      return getModelId();
+    }
+  }, [getModelId, props.fixedModelId]);
   const { modelIds: availableModels } = MODELS;
   const { setTypingTextInput, typingTextOutput } = useTyping(loading);
   const { updateRecentUseUseCase } = useMyUseCases();
+  const { retrieve: retrieveKendra } = useRagApi();
+  const { retrieve: retrieveKnowledgeBase } = useRagKnowledgeBaseApi();
+  const [errorMessages, setErrorMessages] = useState<string[]>([]);
 
   const placeholders = useMemo(() => {
     return extractPlaceholdersFromPromptTemplate(props.promptTemplate);
@@ -106,10 +124,14 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     return getItemsFromPlaceholders(placeholders);
   }, [placeholders]);
 
+  const textFormItems = useMemo(() => {
+    return getTextFormItemsFromItems(items);
+  }, [items]);
+
   useEffect(() => {
-    clear(items.length);
+    clear(textFormItems.length);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items.length]);
+  }, [textFormItems.length]);
 
   useEffect(() => {
     setModelId(
@@ -134,32 +156,131 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages]);
 
-  const onClickExec = useCallback(() => {
+  useEffect(() => {
+    const retrieveKendraItems = items.filter(
+      (i) => i.inputType === 'retrieveKendra'
+    );
+    const retrieveKnowledgeBaseItems = items.filter(
+      (i) => i.inputType === 'retrieveKnowledgeBase'
+    );
+    const hasKendra = retrieveKendraItems.length > 0;
+    const hasKnowledgeBase = retrieveKnowledgeBaseItems.length > 0;
+    const tmpErrorMessages = [];
+
+    if (hasKendra && !ragEnabled) {
+      tmpErrorMessages.push(
+        'プロンプトテンプレート内で {{retrieveKendra}} が指定されていますが GenU で RAG チャット (Amazon Kendra) が有効になっていません。'
+      );
+    }
+
+    if (hasKnowledgeBase && !ragKnowledgeBaseEnabled) {
+      tmpErrorMessages.push(
+        'プロンプトテンプレート内で {{retrieveKnowledgeBase}} が指定されていますが GenU で RAG チャット (Knowledge Base) が有効になっていません。'
+      );
+    }
+
+    for (const item of retrieveKendraItems) {
+      const textForm = textFormItems.find((i) => i.label === item.label);
+
+      if (!textForm) {
+        tmpErrorMessages.push(
+          `Amazon Kendra の検索クエリを入力するためのフォーム {{text${item.label === NOLABEL ? '' : ':' + item.label}}} をプロンプテンプレートに内に記述してください。`
+        );
+      }
+    }
+
+    for (const item of retrieveKnowledgeBaseItems) {
+      const textForm = textFormItems.find((i) => i.label === item.label);
+
+      if (!textForm) {
+        tmpErrorMessages.push(
+          `Knowledge Base の検索クエリを入力するためのフォーム {{text${item.label === NOLABEL ? '' : ':' + item.label}}} をプロンプテンプレートに内に記述してください。`
+        );
+      }
+    }
+
+    setErrorMessages(tmpErrorMessages);
+  }, [setErrorMessages, items, textFormItems]);
+
+  const onClickExec = useCallback(async () => {
     if (loading) return;
+
+    setLoading(true);
+    setText('');
 
     let prompt = props.promptTemplate;
 
-    items.forEach((item, idx) => {
-      let placeholder;
+    for (const [idx, textFormItem] of textFormItems.entries()) {
+      const sameLabelItems = items.filter(
+        (i) => i.label === textFormItem.label
+      );
 
-      if (item.label !== NOLABEL) {
-        placeholder = `{{${item.inputType}:${item.label}}}`;
-      } else {
-        placeholder = `{{${item.inputType}}}`;
+      for (const item of sameLabelItems) {
+        let placeholder;
+
+        if (item.label !== NOLABEL) {
+          placeholder = `{{${item.inputType}:${item.label}}}`;
+        } else {
+          placeholder = `{{${item.inputType}}}`;
+        }
+
+        if (item.inputType === 'text') {
+          prompt = prompt.replace(new RegExp(placeholder, 'g'), values[idx]);
+        } else if (item.inputType === 'retrieveKendra') {
+          if (ragEnabled && values[idx].length > 0) {
+            const res = await retrieveKendra(values[idx]);
+            const resJson = JSON.stringify(res.data.ResultItems);
+            prompt = prompt.replace(new RegExp(placeholder, 'g'), resJson);
+          } else {
+            prompt = prompt.replace(new RegExp(placeholder, 'g'), '');
+          }
+        } else if (item.inputType === 'retrieveKnowledgeBase') {
+          if (ragKnowledgeBaseEnabled && values[idx].length > 0) {
+            const res = await retrieveKnowledgeBase(values[idx]);
+            const resJson = JSON.stringify(res.data.retrievalResults);
+            prompt = prompt.replace(new RegExp(placeholder, 'g'), resJson);
+          } else {
+            prompt = prompt.replace(new RegExp(placeholder, 'g'), '');
+          }
+        }
       }
-      prompt = prompt.replace(new RegExp(placeholder, 'g'), values[idx]);
-    });
+    }
+
     postChat(prompt, true);
     if (!props.previewMode) {
       updateRecentUseUseCase(props.useCaseId);
     }
-  }, [loading, items, postChat, props, updateRecentUseUseCase, values]);
+  }, [
+    loading,
+    items,
+    textFormItems,
+    postChat,
+    props,
+    updateRecentUseUseCase,
+    values,
+    setLoading,
+    retrieveKendra,
+    retrieveKnowledgeBase,
+    setText,
+  ]);
 
   // リセット
   const onClickClear = useCallback(() => {
     clear(items.length);
     clearChat();
   }, [clear, clearChat, items.length]);
+
+  const disabledExec = useMemo(() => {
+    if (props.isLoading || loading) {
+      return true;
+    }
+
+    if (errorMessages.length > 0) {
+      return true;
+    }
+
+    return false;
+  }, [props.isLoading, loading, errorMessages]);
 
   const fillInputsFromExamples = useCallback(
     (examples: Record<string, string>) => {
@@ -210,19 +331,31 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
         )}
       </div>
 
+      {errorMessages.length > 0 &&
+        errorMessages.map((m, idx) => (
+          <div
+            key={idx}
+            className="text-aws-squid-ink mb-2 rounded bg-red-200 p-2 text-sm">
+            {m}
+          </div>
+        ))}
+
       {props.description && (
         <div className="pb-4 text-sm text-gray-600">{props.description}</div>
       )}
 
-      <div className="mb-2 flex w-full flex-col justify-between sm:flex-row">
-        <Select
-          value={modelId}
-          onChange={setModelId}
-          options={availableModels.map((m) => {
-            return { value: m, label: m };
-          })}
-        />
-      </div>
+      {!props.isLoading && props.fixedModelId === '' && (
+        <div className="mb-2 flex w-full flex-col justify-between sm:flex-row">
+          <Select
+            value={modelId}
+            onChange={setModelId}
+            options={availableModels.map((m) => {
+              return { value: m, label: m };
+            })}
+          />
+        </div>
+      )}
+
       {props.isLoading && (
         <div className="my-3 flex flex-col gap-3">
           <Skeleton className="h-28" />
@@ -233,11 +366,11 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
       {!props.isLoading && (
         <>
           <div className="flex flex-col ">
-            {items.map((item, idx) => (
+            {textFormItems.map((item, idx) => (
               <div key={idx}>
                 <Textarea
                   label={item.label !== NOLABEL ? item.label : undefined}
-                  rows={2}
+                  rows={item.inputType === 'text' ? 2 : 1}
                   value={values[idx]}
                   onChange={(v) => {
                     setValue(idx, v);
@@ -271,11 +404,14 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
           )}
         </div>
         <div className="flex shrink-0 gap-3 ">
-          <Button outlined onClick={onClickClear} disabled={props.isLoading}>
+          <Button
+            outlined
+            onClick={onClickClear}
+            disabled={props.isLoading || loading}>
             クリア
           </Button>
 
-          <Button onClick={onClickExec} disabled={props.isLoading}>
+          <Button onClick={onClickExec} disabled={disabledExec}>
             実行
           </Button>
         </div>
