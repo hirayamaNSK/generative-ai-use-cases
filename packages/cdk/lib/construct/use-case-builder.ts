@@ -51,7 +51,7 @@ export class UseCaseBuilder extends Construct {
     });
 
     const commonProperty: NodejsFunctionProps = {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       timeout: Duration.minutes(15),
       environment: {
         USECASE_TABLE_NAME: useCaseBuilderTable.tableName,
@@ -61,7 +61,7 @@ export class UseCaseBuilder extends Construct {
 
     const commonPath = './lambda/useCaseBuilder';
 
-    // UseCaseBuilder 関連の API を追加する
+    // Add UseCaseBuilder related APIs
     const listUseCasesFunction = new NodejsFunction(this, 'ListUseCases', {
       ...commonProperty,
       entry: `${commonPath}/listUseCases.ts`,

@@ -1,4 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useRef,
+} from 'react';
 import Select from '../Select';
 import Button from '../Button';
 import useChat from '../../hooks/useChat';
@@ -15,19 +21,53 @@ import ButtonShare from './ButtonShare';
 import ButtonUseCaseEdit from './ButtonUseCaseEdit';
 import Skeleton from '../Skeleton';
 import useMyUseCases from '../../hooks/useCaseBuilder/useMyUseCases';
-import { UseCaseInputExample } from 'generative-ai-use-cases-jp';
+import { UseCaseInputExample, FileLimit } from 'generative-ai-use-cases';
 import {
   NOLABEL,
   extractPlaceholdersFromPromptTemplate,
   getItemsFromPlaceholders,
   getTextFormItemsFromItems,
+  getTextFormUniqueLabels,
 } from '../../utils/UseCaseBuilderUtils';
 import useRagKnowledgeBaseApi from '../../hooks/useRagKnowledgeBaseApi';
 import useRagApi from '../../hooks/useRagApi';
+import useFiles from '../../hooks/useFiles';
+import ZoomUpImage from '../ZoomUpImage';
+import ZoomUpVideo from '../ZoomUpVideo';
+import FileCard from '../FileCard';
+import { PiPaperclip, PiSpinnerGap } from 'react-icons/pi';
+import { useTranslation } from 'react-i18next';
 
 const ragEnabled: boolean = import.meta.env.VITE_APP_RAG_ENABLED === 'true';
 const ragKnowledgeBaseEnabled: boolean =
   import.meta.env.VITE_APP_RAG_KNOWLEDGE_BASE_ENABLED === 'true';
+
+// Match pages/ChatPage.tsx
+// If a difference occurs, update it
+const fileLimit: FileLimit = {
+  accept: {
+    doc: [
+      '.csv',
+      '.doc',
+      '.docx',
+      '.html',
+      '.md',
+      '.pdf',
+      '.txt',
+      '.xls',
+      '.xlsx',
+      '.gif',
+    ],
+    image: ['.jpg', '.jpeg', '.png', '.webp'],
+    video: ['.mkv', '.mov', '.mp4', '.webm'],
+  },
+  maxFileCount: 5,
+  maxFileSizeMB: 4.5,
+  maxImageFileCount: 20,
+  maxImageFileSizeMB: 3.75,
+  maxVideoFileCount: 1,
+  maxVideoFileSizeMB: 25, // 25 MB for base64 input (TODO: up to 1 GB through S3)
+};
 
 type Props = {
   modelId?: string;
@@ -36,6 +76,7 @@ type Props = {
   description?: string;
   inputExamples?: UseCaseInputExample[];
   fixedModelId: string;
+  fileUpload: boolean;
   isLoading?: boolean;
 } & (
   | {
@@ -55,15 +96,15 @@ type Props = {
 type StateType = {
   text: string;
   setText: (s: string) => void;
-  values: string[];
-  setValue: (index: number, value: string) => void;
-  clear: (valueLength: number) => void;
+  values: { [key: string]: string };
+  setValue: (label: string, value: string) => void;
+  clear: (uniqueLabels: string[]) => void;
 };
 
 const useUseCaseBuilderViewState = create<StateType>((set, get) => {
   const INIT_STATE = {
     text: '',
-    values: [],
+    values: {},
   };
   return {
     ...INIT_STATE,
@@ -72,17 +113,20 @@ const useUseCaseBuilderViewState = create<StateType>((set, get) => {
         text: s,
       }));
     },
-    setValue: (index, value) => {
+    setValue: (label, value) => {
       set(() => ({
         values: produce(get().values, (draft) => {
-          draft[index] = value;
+          draft[label] = value;
         }),
       }));
     },
-    clear: (valueLength: number) => {
+    clear: (uniqueLabels: string[]) => {
       set({
         ...INIT_STATE,
-        values: new Array(valueLength).fill(''),
+        values: uniqueLabels.reduce(
+          (obj, label) => Object.assign(obj, { [label]: '' }),
+          {}
+        ),
       });
     },
   };
@@ -90,6 +134,7 @@ const useUseCaseBuilderViewState = create<StateType>((set, get) => {
 
 const UseCaseBuilderView: React.FC<Props> = (props) => {
   const { pathname } = useLocation();
+  const { t } = useTranslation();
 
   const { text, setText, values, setValue, clear } =
     useUseCaseBuilderViewState();
@@ -100,7 +145,9 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     setLoading,
     messages,
     postChat,
+    continueGeneration,
     clear: clearChat,
+    getStopReason,
   } = useChat(pathname);
   const modelId = useMemo(() => {
     if (props.fixedModelId !== '') {
@@ -114,6 +161,18 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
   const { updateRecentUseUseCase } = useMyUseCases();
   const { retrieve: retrieveKendra } = useRagApi();
   const { retrieve: retrieveKnowledgeBase } = useRagKnowledgeBaseApi();
+  const {
+    uploadedFiles,
+    uploadFiles,
+    checkFiles,
+    deleteUploadedFile,
+    uploading,
+    errorMessages: fileErrorMessages,
+    clear: clearFiles,
+  } = useFiles(pathname);
+  const stopReason = getStopReason();
+  const [isOver, setIsOver] = useState(false);
+
   const [errorMessages, setErrorMessages] = useState<string[]>([]);
 
   const placeholders = useMemo(() => {
@@ -128,10 +187,30 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     return getTextFormItemsFromItems(items);
   }, [items]);
 
+  const selectItems = useMemo(() => {
+    return textFormItems.filter((i) => i.inputType === 'select');
+  }, [textFormItems]);
+
+  const textFormUniqueLabels = useMemo(() => {
+    return getTextFormUniqueLabels(textFormItems);
+  }, [textFormItems]);
+
   useEffect(() => {
-    clear(textFormItems.length);
+    clear(textFormUniqueLabels);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [textFormItems.length]);
+  }, [textFormUniqueLabels]);
+
+  useEffect(() => {
+    for (const item of selectItems) {
+      if (
+        item.options &&
+        item.options.length > 0 &&
+        values[item.label] === ''
+      ) {
+        setValue(item.label, item.options.split(',')[0]);
+      }
+    }
+  }, [selectItems, values, setValue]);
 
   useEffect(() => {
     setModelId(
@@ -146,7 +225,7 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     setTypingTextInput(text);
   }, [text, setTypingTextInput]);
 
-  // リアルタイムにレスポンスを表示
+  // Display the real-time response
   useEffect(() => {
     if (messages.length === 0) return;
     const _lastMessage = messages[messages.length - 1];
@@ -168,14 +247,12 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     const tmpErrorMessages = [];
 
     if (hasKendra && !ragEnabled) {
-      tmpErrorMessages.push(
-        'プロンプトテンプレート内で {{retrieveKendra}} が指定されていますが GenU で RAG チャット (Amazon Kendra) が有効になっていません。'
-      );
+      tmpErrorMessages.push(t('useCaseBuilder.error.rag_kendra_not_enabled'));
     }
 
     if (hasKnowledgeBase && !ragKnowledgeBaseEnabled) {
       tmpErrorMessages.push(
-        'プロンプトテンプレート内で {{retrieveKnowledgeBase}} が指定されていますが GenU で RAG チャット (Knowledge Base) が有効になっていません。'
+        t('useCaseBuilder.error.rag_knowledge_base_not_enabled')
       );
     }
 
@@ -184,7 +261,9 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
 
       if (!textForm) {
         tmpErrorMessages.push(
-          `Amazon Kendra の検索クエリを入力するためのフォーム {{text${item.label === NOLABEL ? '' : ':' + item.label}}} をプロンプテンプレートに内に記述してください。`
+          t('useCaseBuilder.error.missing_text_form', {
+            label: item.label === NOLABEL ? '' : ':' + item.label,
+          })
         );
       }
     }
@@ -194,13 +273,53 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
 
       if (!textForm) {
         tmpErrorMessages.push(
-          `Knowledge Base の検索クエリを入力するためのフォーム {{text${item.label === NOLABEL ? '' : ':' + item.label}}} をプロンプテンプレートに内に記述してください。`
+          t('useCaseBuilder.error.missing_kb_text_form', {
+            label: item.label === NOLABEL ? '' : ':' + item.label,
+          })
         );
       }
     }
 
+    for (const item of selectItems) {
+      if (!item.options || item.options.length === 0) {
+        tmpErrorMessages.push(t('useCaseBuilder.error.missing_select_options'));
+      } else {
+        const options = item.options.split(',');
+        const emptyOptions = options.filter((o) => o === '');
+
+        if (emptyOptions.length > 0) {
+          tmpErrorMessages.push(
+            t('useCaseBuilder.error.empty_select_options', {
+              label: item.label,
+            })
+          );
+        }
+
+        const uniqueOptions = options.filter(
+          (elem, idx, self) => self.findIndex((e) => e === elem) === idx
+        );
+
+        if (options.length !== uniqueOptions.length) {
+          tmpErrorMessages.push(
+            t('useCaseBuilder.error.duplicate_select_options', {
+              label: item.label,
+            })
+          );
+        }
+      }
+    }
+
+    tmpErrorMessages.push(...fileErrorMessages);
+
     setErrorMessages(tmpErrorMessages);
-  }, [setErrorMessages, items, textFormItems]);
+  }, [
+    setErrorMessages,
+    items,
+    textFormItems,
+    fileErrorMessages,
+    selectItems,
+    t,
+  ]);
 
   const onClickExec = useCallback(async () => {
     if (loading) return;
@@ -210,7 +329,7 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
 
     let prompt = props.promptTemplate;
 
-    for (const [idx, textFormItem] of textFormItems.entries()) {
+    for (const textFormItem of textFormItems) {
       const sameLabelItems = items.filter(
         (i) => i.label === textFormItem.label
       );
@@ -219,24 +338,33 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
         let placeholder;
 
         if (item.label !== NOLABEL) {
-          placeholder = `{{${item.inputType}:${item.label}}}`;
+          if (item.options) {
+            placeholder = `{{${item.inputType}:${item.label}:${item.options}}}`;
+          } else {
+            placeholder = `{{${item.inputType}:${item.label}}}`;
+          }
         } else {
           placeholder = `{{${item.inputType}}}`;
         }
 
-        if (item.inputType === 'text') {
-          prompt = prompt.replace(new RegExp(placeholder, 'g'), values[idx]);
+        if (item.inputType === 'text' || item.inputType === 'select') {
+          prompt = prompt.replace(
+            new RegExp(placeholder, 'g'),
+            values[item.label]
+          );
+        } else if (item.inputType === 'form') {
+          prompt = prompt.replace(new RegExp(placeholder, 'g'), '');
         } else if (item.inputType === 'retrieveKendra') {
-          if (ragEnabled && values[idx].length > 0) {
-            const res = await retrieveKendra(values[idx]);
+          if (ragEnabled && values[item.label].length > 0) {
+            const res = await retrieveKendra(values[item.label]);
             const resJson = JSON.stringify(res.data.ResultItems);
             prompt = prompt.replace(new RegExp(placeholder, 'g'), resJson);
           } else {
             prompt = prompt.replace(new RegExp(placeholder, 'g'), '');
           }
         } else if (item.inputType === 'retrieveKnowledgeBase') {
-          if (ragKnowledgeBaseEnabled && values[idx].length > 0) {
-            const res = await retrieveKnowledgeBase(values[idx]);
+          if (ragKnowledgeBaseEnabled && values[item.label].length > 0) {
+            const res = await retrieveKnowledgeBase(values[item.label]);
             const resJson = JSON.stringify(res.data.retrievalResults);
             prompt = prompt.replace(new RegExp(placeholder, 'g'), resJson);
           } else {
@@ -246,7 +374,14 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
       }
     }
 
-    postChat(prompt, true);
+    postChat(
+      prompt,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      uploadedFiles.length > 0 ? uploadedFiles : undefined
+    );
     if (!props.previewMode) {
       updateRecentUseUseCase(props.useCaseId);
     }
@@ -262,13 +397,15 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
     retrieveKendra,
     retrieveKnowledgeBase,
     setText,
+    uploadedFiles,
   ]);
 
-  // リセット
+  // Reset
   const onClickClear = useCallback(() => {
-    clear(items.length);
+    clear(textFormUniqueLabels);
     clearChat();
-  }, [clear, clearChat, items.length]);
+    clearFiles();
+  }, [clear, clearChat, clearFiles, textFormUniqueLabels]);
 
   const disabledExec = useMemo(() => {
     if (props.isLoading || loading) {
@@ -285,26 +422,108 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
   const fillInputsFromExamples = useCallback(
     (examples: Record<string, string>) => {
       Object.entries(examples).forEach(([key, value]) => {
-        const idx = items.findIndex((item) => item.label === key);
-        if (idx >= 0) {
-          setValue(idx, value);
-        }
+        setValue(key, value);
       });
     },
-    [items, setValue]
+    [setValue]
   );
 
+  const accept = useMemo(() => {
+    if (!modelId) return [];
+    const feature = MODELS.modelFeatureFlags[modelId];
+    return [
+      ...(feature.doc ? fileLimit.accept.doc : []),
+      ...(feature.image ? fileLimit.accept.image : []),
+      ...(feature.video ? fileLimit.accept.video : []),
+    ];
+  }, [modelId]);
+
+  useEffect(() => {
+    checkFiles(fileLimit, accept);
+  }, [checkFiles, accept]);
+
+  const fileInput = useRef<HTMLInputElement | null>(null);
+
+  const onChangeFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (files) {
+      uploadFiles(Array.from(files), fileLimit, accept);
+
+      if (fileInput.current) {
+        fileInput.current.value = '';
+      }
+    }
+  };
+
+  const deleteFile = useCallback(
+    (fileId: string) => {
+      if (fileLimit && accept) {
+        deleteUploadedFile(fileId, fileLimit, accept);
+      }
+    },
+    [deleteUploadedFile, accept]
+  );
+
+  const handleDragOver = (event: React.DragEvent) => {
+    // When a file is dragged, display the overlay
+    event.preventDefault();
+    setIsOver(true);
+  };
+
+  const handleDragLeave = (event: React.DragEvent) => {
+    // When a file is dragged, hide the overlay
+    event.preventDefault();
+    setIsOver(false);
+  };
+
+  const handleDrop = (event: React.DragEvent) => {
+    // When a file is dropped, add the file
+    event.preventDefault();
+    setIsOver(false);
+    if (event.dataTransfer.files) {
+      // Upload the file
+      uploadFiles(Array.from(event.dataTransfer.files), fileLimit, accept);
+    }
+  };
+
+  const handlePaste = async (pasteEvent: React.ClipboardEvent) => {
+    const fileList = pasteEvent.clipboardData.items || [];
+    const files = Array.from(fileList)
+      .filter((file) => file.kind === 'file')
+      .map((file) => file.getAsFile() as File);
+    if (files.length > 0 && fileLimit && accept) {
+      // Upload the file
+      uploadFiles(Array.from(files), fileLimit, accept);
+      // Because the file name is also pasted when a file is pasted, prevent the default behavior
+      pasteEvent.preventDefault();
+    }
+    // If there is no file, the default behavior (paste text)
+  };
+
   return (
-    <div>
+    <div
+      onDragOver={props.fileUpload ? handleDragOver : undefined}
+      onDragLeave={props.fileUpload ? handleDragLeave : undefined}
+      onPaste={props.fileUpload ? handlePaste : undefined}
+      className="relative">
+      {isOver && props.fileUpload && (
+        <div
+          onDrop={handleDrop}
+          className="absolute inset-0 z-[999] bg-slate-300 p-10 text-center">
+          <div className="flex h-full w-full items-center justify-center outline-dashed">
+            <div className="font-bold">{t('chat.drop_files')}</div>
+          </div>
+        </div>
+      )}
       <div className="mb-4 flex flex-col-reverse text-xl font-semibold md:flex-row">
         {!props.previewMode && <div className="flex-1" />}
         <div
           className={`${props.previewMode ? '' : 'hidden lg:block'} flex flex-row justify-center`}>
           {props.isLoading
-            ? '読み込み中...'
+            ? t('common.loading')
             : props.title
               ? props.title
-              : '[タイトル未入力]'}
+              : t('useCaseBuilder.untitledUseCase')}
         </div>
         {!props.previewMode && (
           <div className="mb-2 flex min-w-48 flex-1 flex-row items-start justify-end md:mb-0">
@@ -368,24 +587,115 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
           <div className="flex flex-col ">
             {textFormItems.map((item, idx) => (
               <div key={idx}>
-                <Textarea
-                  label={item.label !== NOLABEL ? item.label : undefined}
-                  rows={item.inputType === 'text' ? 2 : 1}
-                  value={values[idx]}
-                  onChange={(v) => {
-                    setValue(idx, v);
-                  }}
-                />
+                {(item.inputType === 'text' || item.inputType === 'form') && (
+                  <Textarea
+                    label={item.label !== NOLABEL ? item.label : undefined}
+                    rows={item.inputType === 'text' ? 2 : 1}
+                    value={values[item.label]}
+                    onChange={(v) => {
+                      setValue(item.label, v);
+                    }}
+                  />
+                )}
+                {item.inputType === 'select' && (
+                  <Select
+                    label={item.label !== NOLABEL ? item.label : undefined}
+                    value={values[item.label] ?? ''}
+                    options={
+                      item.options?.split(',')?.map((v: string) => {
+                        return { value: v, label: v };
+                      }) ?? []
+                    }
+                    onChange={(value) => {
+                      setValue(item.label, value);
+                    }}
+                  />
+                )}
               </div>
             ))}
           </div>
+
+          {props.fileUpload && (
+            <div className="mb-3 flex flex-col">
+              <label className="w-fit">
+                <input
+                  hidden
+                  type="file"
+                  accept={accept.join(',')}
+                  onChange={onChangeFile}
+                  ref={fileInput}
+                />
+                <div
+                  className={`${uploading ? 'bg-gray-300' : 'bg-aws-smile cursor-pointer '} flex w-fit items-center justify-center rounded-lg border px-2 py-1 text-white`}>
+                  {uploading ? (
+                    <PiSpinnerGap className="animate-spin" />
+                  ) : (
+                    <PiPaperclip />
+                  )}
+                  {t('useCaseBuilder.attach_file')}
+                </div>
+              </label>
+
+              {uploadedFiles.length > 0 && (
+                <div className="my-2 flex flex-wrap gap-2">
+                  {uploadedFiles.map((uploadedFile, idx) => {
+                    if (uploadedFile.type === 'image') {
+                      return (
+                        <ZoomUpImage
+                          key={idx}
+                          src={uploadedFile.base64EncodedData}
+                          loading={uploadedFile.uploading}
+                          deleting={uploadedFile.deleting}
+                          size="s"
+                          error={uploadedFile.errorMessages.length > 0}
+                          onDelete={() => {
+                            deleteFile(uploadedFile.id ?? '');
+                          }}
+                        />
+                      );
+                    } else if (uploadedFile.type === 'video') {
+                      return (
+                        <ZoomUpVideo
+                          key={idx}
+                          src={uploadedFile.base64EncodedData}
+                          loading={uploadedFile.uploading}
+                          deleting={uploadedFile.deleting}
+                          size="s"
+                          error={uploadedFile.errorMessages.length > 0}
+                          onDelete={() => {
+                            deleteFile(uploadedFile.id ?? '');
+                          }}
+                        />
+                      );
+                    } else {
+                      return (
+                        <FileCard
+                          key={idx}
+                          filename={uploadedFile.name}
+                          loading={uploadedFile.uploading}
+                          deleting={uploadedFile.deleting}
+                          size="s"
+                          error={uploadedFile.errorMessages.length > 0}
+                          onDelete={() => {
+                            deleteFile(uploadedFile.id ?? '');
+                          }}
+                        />
+                      );
+                    }
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </>
       )}
       <div className="flex flex-1 items-end justify-between">
         <div>
           {props.inputExamples && props.inputExamples.length > 0 && (
             <>
-              <div className="mb-1 text-sm font-bold text-gray-600">入力例</div>
+              <div className="mb-1 text-sm font-bold text-gray-600">
+                {t('useCaseBuilder.inputExamples')}
+              </div>
               <div className="flex flex-wrap gap-2">
                 {props.inputExamples.map((inputExample, idx) => {
                   return (
@@ -395,7 +705,9 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
                       onClick={() => {
                         fillInputsFromExamples(inputExample.examples);
                       }}>
-                      {inputExample.title ? inputExample.title : '[未入力]'}
+                      {inputExample.title
+                        ? inputExample.title
+                        : t('useCaseBuilder.untitled')}
                     </button>
                   );
                 })}
@@ -404,15 +716,21 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
           )}
         </div>
         <div className="flex shrink-0 gap-3 ">
+          {stopReason === 'max_tokens' && (
+            <Button onClick={continueGeneration}>
+              {t('translate.continue_output')}
+            </Button>
+          )}
+
           <Button
             outlined
             onClick={onClickClear}
             disabled={props.isLoading || loading}>
-            クリア
+            {t('common.clear')}
           </Button>
 
           <Button onClick={onClickExec} disabled={disabledExec}>
-            実行
+            {t('common.execute')}
           </Button>
         </div>
       </div>
@@ -420,7 +738,9 @@ const UseCaseBuilderView: React.FC<Props> = (props) => {
       <div className="mt-5 rounded border border-black/30 p-1.5">
         <Markdown>{typingTextOutput}</Markdown>
         {!loading && text === '' && (
-          <div className="text-gray-500">実行結果がここに表示されます</div>
+          <div className="text-gray-500">
+            {t('useCaseBuilder.resultPlaceholder')}
+          </div>
         )}
         {loading && (
           <div className="border-aws-sky size-5 animate-spin rounded-full border-4 border-t-transparent"></div>

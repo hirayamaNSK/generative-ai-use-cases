@@ -6,7 +6,8 @@ import {
   UserIdAndChatId,
   SystemContext,
   UpdateFeedbackRequest,
-} from 'generative-ai-use-cases-jp';
+  ListChatsResponse,
+} from 'generative-ai-use-cases';
 import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
@@ -106,7 +107,7 @@ export const findSystemContextById = async (
 export const listChats = async (
   _userId: string,
   _exclusiveStartKey?: string
-): Promise<{ chats: Chat[]; lastEvaluatedKey?: string }> => {
+): Promise<ListChatsResponse> => {
   const exclusiveStartKey = _exclusiveStartKey
     ? JSON.parse(Buffer.from(_exclusiveStartKey, 'base64').toString())
     : undefined;
@@ -122,13 +123,13 @@ export const listChats = async (
         ':id': userId,
       },
       ScanIndexForward: false,
-      Limit: 100, // チャットのリストは 1 度に 100 件返す
+      Limit: 100, // Return the list of chats in 100 items at a time
       ExclusiveStartKey: exclusiveStartKey,
     })
   );
 
   return {
-    chats: res.Items as Chat[],
+    data: res.Items as Chat[],
     lastEvaluatedKey: res.LastEvaluatedKey
       ? Buffer.from(JSON.stringify(res.LastEvaluatedKey)).toString('base64')
       : undefined,
@@ -311,7 +312,7 @@ export const deleteChat = async (
   _userId: string,
   _chatId: string
 ): Promise<void> => {
-  // Chat の削除
+  // Delete Chat
   const chatItem = await findChatById(_userId, _chatId);
   await dynamoDbDocument.send(
     new DeleteCommand({
@@ -323,7 +324,7 @@ export const deleteChat = async (
     })
   );
 
-  // // Message の削除
+  // Delete Messages
   const messageItems = await listMessages(_chatId);
   await dynamoDbDocument.send(
     new BatchWriteCommand({
@@ -371,7 +372,7 @@ export const deleteSystemContext = async (
   _userId: string,
   _systemContextId: string
 ): Promise<void> => {
-  // System Context の削除
+  // Delete System Context
   const systemContext = await findSystemContextById(_userId, _systemContextId);
   await dynamoDbDocument.send(
     new DeleteCommand({
@@ -487,8 +488,8 @@ export const findShareId = async (
 export const deleteShareId = async (_shareId: string): Promise<void> => {
   const userIdAndChatId = await findUserIdAndChatId(_shareId);
   const share = await findShareId(
-    // SAML 認証だと userId に # が含まれるため
-    // 例: user#EntraID_hogehoge.com#EXT#@hogehoge.onmicrosoft.com
+    // SAML authentication includes # in userId
+    // Example: user#EntraID_hogehoge.com#EXT#@hogehoge.onmicrosoft.com
     userIdAndChatId!.userId.split('#').slice(1).join('#'),
     userIdAndChatId!.chatId.split('#')[1]
   );

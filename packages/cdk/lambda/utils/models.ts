@@ -1,10 +1,11 @@
 import {
   BedrockImageGenerationResponse,
   GenerateImageParams,
+  GenerateVideoParams,
   Model,
+  ModelConfiguration,
   PromptTemplate,
   StableDiffusionParams,
-  AmazonImageParams,
   UnrecordedMessage,
   ConverseInferenceParams,
   UsecaseConverseInferenceParams,
@@ -12,7 +13,10 @@ import {
   GuardrailConverseStreamConfigParams,
   StabilityAI2024ModelParams,
   StabilityAI2024ModelResponse,
-} from 'generative-ai-use-cases-jp';
+  AmazonGeneralImageParams,
+  AmazonAdvancedImageParams,
+  StreamingChunk,
+} from 'generative-ai-use-cases';
 import {
   ConverseCommandInput,
   ConverseCommandOutput,
@@ -21,25 +25,63 @@ import {
   ConversationRole,
   ContentBlock,
 } from '@aws-sdk/client-bedrock-runtime';
+import { modelFeatureFlags } from '@generative-ai-use-cases/common';
 
 // Default Models
 
-const modelId: string = JSON.parse(process.env.MODEL_IDS!)
-  .map((name: string) => name.trim())
-  .filter((name: string) => name)[0]!;
+const modelIds: ModelConfiguration[] = (
+  JSON.parse(process.env.MODEL_IDS || '[]') as ModelConfiguration[]
+)
+  .map((model) => ({
+    modelId: model.modelId.trim(),
+    region: model.region.trim(),
+  }))
+  .filter((model) => model.modelId);
+// If there is a lightweight model among the available models, prioritize the lightweight model.
+const lightWeightModelIds = modelIds.filter(
+  (model: ModelConfiguration) => modelFeatureFlags[model.modelId].light
+);
+const defaultModelConfiguration = lightWeightModelIds[0] || modelIds[0];
 export const defaultModel: Model = {
   type: 'bedrock',
-  modelId: modelId,
+  modelId: defaultModelConfiguration.modelId,
+  region: defaultModelConfiguration.region,
 };
 
-const imageGenerationModelId: string = JSON.parse(
-  process.env.IMAGE_GENERATION_MODEL_IDS!
+const imageGenerationModels: ModelConfiguration[] = (
+  JSON.parse(
+    process.env.IMAGE_GENERATION_MODEL_IDS || '[]'
+  ) as ModelConfiguration[]
 )
-  .map((name: string) => name.trim())
-  .filter((name: string) => name)[0]!;
+  .map(
+    (model: ModelConfiguration): ModelConfiguration => ({
+      modelId: model.modelId.trim(),
+      region: model.region.trim(),
+    })
+  )
+  .filter((model) => model.modelId);
 export const defaultImageGenerationModel: Model = {
   type: 'bedrock',
-  modelId: imageGenerationModelId,
+  modelId: imageGenerationModels?.[0]?.modelId ?? '',
+  region: imageGenerationModels?.[0]?.region ?? '',
+};
+
+const videoGenerationModels: ModelConfiguration[] = (
+  JSON.parse(
+    process.env.VIDEO_GENERATION_MODEL_IDS || '[]'
+  ) as ModelConfiguration[]
+)
+  .map(
+    (model: ModelConfiguration): ModelConfiguration => ({
+      modelId: model.modelId.trim(),
+      region: model.region.trim(),
+    })
+  )
+  .filter((model) => model.modelId);
+export const defaultVideoGenerationModel: Model = {
+  type: 'bedrock',
+  modelId: videoGenerationModels?.[0]?.modelId ?? '',
+  region: videoGenerationModels?.[0]?.region ?? '',
 };
 
 // Prompt Templates
@@ -54,6 +96,7 @@ const LLAMA_PROMPT: PromptTemplate = {
   eosToken: '</s>',
 };
 
+/* eslint-disable i18nhelper/no-jp-string */
 const BILINGUAL_RINNA_PROMPT: PromptTemplate = {
   prefix: '',
   suffix: 'システム: ',
@@ -73,8 +116,15 @@ const RINNA_PROMPT: PromptTemplate = {
   system: 'システム: {}',
   eosToken: '</s>',
 };
+/* eslint-enable i18nhelper/no-jp-string */
 
 // Model Params
+
+const CLAUDE_3_5_DEFAULT_PARAMS: ConverseInferenceParams = {
+  maxTokens: 8192,
+  temperature: 0.6,
+  topP: 0.8,
+};
 
 const CLAUDE_DEFAULT_PARAMS: ConverseInferenceParams = {
   maxTokens: 4096,
@@ -83,8 +133,8 @@ const CLAUDE_DEFAULT_PARAMS: ConverseInferenceParams = {
 };
 
 const TITAN_TEXT_DEFAULT_PARAMS: ConverseInferenceParams = {
-  // Doc 上は 3072 まで受け付けるが、Converse API だと 3000 までしか受け付けなかったため、3000 を設定する。
-  // 3072 が受け付けられるように修正されたら戻す。
+  // Converse API only accepts 3000, instead of 3072, which is described in the doc.
+  // If 3072 is accepted, revert to 3072.
   // https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-titan-text.html
   maxTokens: 3000,
   temperature: 0.7,
@@ -121,13 +171,19 @@ const NOVA_DEFAULT_PARAMS: ConverseInferenceParams = {
   topP: 0.9,
 };
 
+const DEEPSEEK_DEFAULT_PARAMS: ConverseInferenceParams = {
+  maxTokens: 32768,
+  temperature: 0.6,
+  topP: 0.95,
+};
+
 const USECASE_DEFAULT_PARAMS: UsecaseConverseInferenceParams = {
   '/rag': {
     temperature: 0.0,
   },
 };
 
-// guardrail 設定
+// Guardrail Settings
 const createGuardrailConfig = (): GuardrailConverseConfigParams | undefined => {
   if (
     process.env.GUARDRAIL_IDENTIFIER !== undefined &&
@@ -136,7 +192,7 @@ const createGuardrailConfig = (): GuardrailConverseConfigParams | undefined => {
     return {
       guardrailIdentifier: process.env.GUARDRAIL_IDENTIFIER,
       guardrailVersion: process.env.GUARDRAIL_VERSION,
-      // 出力が重くなる&現状トレースを確認する手段がアプリ側に無いので disabled をハードコーディング
+      // Outputs become heavy and there is no way to check the trace on the app side, so disabled is hard-coded
       trace: 'disabled',
     };
   }
@@ -150,8 +206,9 @@ const createGuardrailStreamConfig = ():
   if (baseConfig) {
     return {
       ...baseConfig,
-      // 非同期だとマズい出力が出る可能性があるが、まずい入力をしない限り出力が出たことがない（＝入力時点でストップ）ので、
-      // 非同期で体験を良くすることとする
+      // Although there is a possibility that a bad output will occur when using asynchronous processing,
+      // since it has never occurred even with bad inputs (i.e., stopping at the input point),
+      // use asynchronous processing to improve the experience.
       // https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-streaming.html
       streamProcessingMode: 'async',
     };
@@ -159,13 +216,13 @@ const createGuardrailStreamConfig = ():
   return undefined;
 };
 
-// ID変換ルール
+// ID conversion rules
 const idTransformationRules = [
-  // チャット履歴 -> チャット
+  // Chat history -> Chat
   { pattern: /^\/chat\/.+/, replacement: '/chat' },
 ];
 
-// ID変換
+// ID conversion
 function normalizeId(id: string): string {
   if (!id) return id;
   const rule = idTransformationRules.find((rule) => id.match(rule.pattern));
@@ -173,20 +230,20 @@ function normalizeId(id: string): string {
   return ret;
 }
 
-// API の呼び出しや、出力から文字列を抽出、などの処理
+// API call, extract string from output, etc.
 
 const createConverseCommandInput = (
   messages: UnrecordedMessage[],
   id: string,
-  modelId: string,
+  model: Model,
   defaultConverseInferenceParams: ConverseInferenceParams,
   usecaseConverseInferenceParams: UsecaseConverseInferenceParams
 ) => {
-  // system role で渡された文字列を、システムプロンプトに設定
+  // Set the string passed in the system role to the system prompt
   const system = messages.find((message) => message.role === 'system');
   const systemContext = system ? [{ text: system.content }] : [];
 
-  // system role 以外の、user role と assistant role の文字列を conversation に入れる
+  // Add the string of user role and assistant role other than the system role to the conversation
   messages = messages.filter((message) => message.role !== 'system');
   const conversation = messages.map((message) => {
     const contentBlocks: ContentBlock[] = [
@@ -210,7 +267,7 @@ const createConverseCommandInput = (
               format: extra.name.split('.').pop(),
               name: extra.name
                 .split('.')[0]
-                .replace(/[^a-zA-Z0-9\s\-()[\]]/g, 'X'), // ファイル名に日本語などが入っているとエラーになるため変換
+                .replace(/[^a-zA-Z0-9\s\-()[\]]/g, 'X'), // If the file name contains Japanese, it will cause an error, so convert it
               source: {
                 bytes: Buffer.from(extra.source.data, 'base64'),
               },
@@ -222,6 +279,17 @@ const createConverseCommandInput = (
               format: extra.source.mediaType.split('/')[1],
               source: {
                 bytes: Buffer.from(extra.source.data, 'base64'),
+              },
+            },
+          } as ContentBlock.VideoMember);
+        } else if (extra.type === 'video' && extra.source.type === 's3') {
+          contentBlocks.push({
+            video: {
+              format: extra.source.mediaType.split('/')[1],
+              source: {
+                s3Location: {
+                  uri: extra.source.data,
+                },
               },
             },
           } as ContentBlock.VideoMember);
@@ -246,28 +314,49 @@ const createConverseCommandInput = (
   const guardrailConfig = createGuardrailConfig();
 
   const converseCommandInput: ConverseCommandInput = {
-    modelId: modelId,
+    modelId: model.modelId,
     messages: conversation,
     system: systemContext,
     inferenceConfig: inferenceConfig,
     guardrailConfig: guardrailConfig,
   };
 
+  if (
+    modelFeatureFlags[model.modelId].reasoning &&
+    model.modelParameters?.reasoningConfig?.type === 'enabled'
+  ) {
+    converseCommandInput.inferenceConfig = {
+      ...inferenceConfig,
+      temperature: 1, // reasoning requires temperature to be 1
+      topP: undefined, // reasoning does not require topP
+      maxTokens:
+        (model.modelParameters?.reasoningConfig?.budgetTokens || 0) +
+        (inferenceConfig?.maxTokens || 0),
+    };
+    converseCommandInput.additionalModelRequestFields = {
+      reasoning_config: {
+        type: model.modelParameters?.reasoningConfig?.type,
+        budget_tokens:
+          model.modelParameters?.reasoningConfig?.budgetTokens || 0,
+      },
+    };
+  }
+
   return converseCommandInput;
 };
 
-// システムプロンプトに対応していないモデル用の関数
-// - Amazon Titan モデル (amazon.titan-text-premier-v1:0)
+// Function for models that do not support system prompts
+// - Amazon Titan model (amazon.titan-text-premier-v1:0)
 // - Mistral AI Instruct (mistral.mixtral-8x7b-instruct-v0:1, mistral.mistral-7b-instruct-v0:2)
 // https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#conversation-inference-supported-models-features
 const createConverseCommandInputWithoutSystemContext = (
   messages: UnrecordedMessage[],
   id: string,
-  modelId: string,
+  model: Model,
   defaultConverseInferenceParams: ConverseInferenceParams,
   usecaseConverseInferenceParams: UsecaseConverseInferenceParams
 ) => {
-  // system が利用できないので、system も user として入れる。
+  // Since system is not available, system is also included as user.
   messages = messages.filter((message) => message.role !== 'system');
   const conversation = messages.map((message) => ({
     role:
@@ -285,7 +374,7 @@ const createConverseCommandInputWithoutSystemContext = (
   const guardrailConfig = createGuardrailConfig();
 
   const converseCommandInput: ConverseCommandInput = {
-    modelId: modelId,
+    modelId: model.modelId,
     messages: conversation,
     inferenceConfig: inferenceConfig,
     guardrailConfig: guardrailConfig,
@@ -294,18 +383,18 @@ const createConverseCommandInputWithoutSystemContext = (
   return converseCommandInput;
 };
 
-// ConverseStreamCommandInput は、同じ構造を持つため「createConverseCommandInput」で作成したインプットをそのまま利用する。
+// ConverseStreamCommandInput has the same structure as ConverseCommandInput, so the input created by "createConverseCommandInput" can be used as is.
 const createConverseStreamCommandInput = (
   messages: UnrecordedMessage[],
   id: string,
-  modelId: string,
+  model: Model,
   defaultParams: ConverseInferenceParams,
   usecaseParams: UsecaseConverseInferenceParams
 ): ConverseStreamCommandInput => {
   const converseCommandInput = createConverseCommandInput(
     messages,
     id,
-    modelId,
+    model,
     defaultParams,
     usecaseParams
   );
@@ -316,21 +405,21 @@ const createConverseStreamCommandInput = (
   } as ConverseStreamCommandInput;
 };
 
-// システムプロンプトに対応していないモデル用の関数
-// - Amazon Titan モデル (amazon.titan-text-premier-v1:0)
+// Function for models that do not support system prompts
+// - Amazon Titan model (amazon.titan-text-premier-v1:0)
 // - Mistral AI Instruct (mistral.mixtral-8x7b-instruct-v0:1, mistral.mistral-7b-instruct-v0:2)
 // https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html#conversation-inference-supported-models-features
 const createConverseStreamCommandInputWithoutSystemContext = (
   messages: UnrecordedMessage[],
   id: string,
-  modelId: string,
+  model: Model,
   defaultParams: ConverseInferenceParams,
   usecaseParams: UsecaseConverseInferenceParams
 ): ConverseStreamCommandInput => {
   const converseCommandInput = createConverseCommandInputWithoutSystemContext(
     messages,
     id,
-    modelId,
+    model,
     defaultParams,
     usecaseParams
   );
@@ -341,27 +430,44 @@ const createConverseStreamCommandInputWithoutSystemContext = (
   } as ConverseStreamCommandInput;
 };
 
-const extractConverseOutputText = (output: ConverseCommandOutput): string => {
+const extractConverseOutput = (
+  output: ConverseCommandOutput
+): StreamingChunk => {
   if (output.output && output.output.message && output.output.message.content) {
-    // output.message.content は配列になっているが、基本的に要素は 1 個しか返ってこないため、join をする必要はない。
-    // ただ、安全側に実装することを意識して、配列に複数の要素が来ても問題なく動作するように、join で改行を付けるよ実装にしておく。
+    // output.message.content is an array, but usually only one element is returned, so join is not necessary.
+    // However, to implement on the safe side, join is implemented so that it works even if an array with multiple elements comes.
     const responseText = output.output.message.content
       .map((block) => block.text)
       .join('\n');
-    return responseText;
+    const reasoningText = output.output.message.content
+      .map((block) => {
+        if (block.reasoningContent) {
+          return block.reasoningContent.reasoningText?.text;
+        }
+        return '';
+      })
+      .join('\n');
+    return { text: responseText, trace: reasoningText };
   }
 
-  return '';
+  return { text: '', trace: '' };
 };
 
-const extractConverseStreamOutputText = (
+const extractConverseStreamOutput = (
   output: ConverseStreamOutput
-): string => {
+): StreamingChunk => {
   if (output.contentBlockDelta && output.contentBlockDelta.delta?.text) {
-    return output.contentBlockDelta.delta?.text;
+    return { text: output.contentBlockDelta.delta?.text };
+  } else if (
+    output.contentBlockDelta &&
+    output.contentBlockDelta.delta?.reasoningContent
+  ) {
+    const reasoningText =
+      output.contentBlockDelta.delta?.reasoningContent?.text;
+    return { text: '', trace: reasoningText };
   }
 
-  return '';
+  return { text: '', trace: '' };
 };
 
 const createBodyImageStableDiffusion = (params: GenerateImageParams) => {
@@ -371,7 +477,7 @@ const createBodyImageStableDiffusion = (params: GenerateImageParams) => {
     style_preset: params.stylePreset,
     seed: params.seed,
     steps: params.step,
-    image_strength: params.maskImage ? 0 : params.imageStrength, // Inpaint/Outpaint 時に 0 以上だと悪さする
+    image_strength: params.maskImage ? 0 : params.imageStrength, // When inpainting/outpainting, 0 or above is bad
     height: params.height,
     width: params.width,
   };
@@ -388,7 +494,7 @@ const createBodyImageStableDiffusion = (params: GenerateImageParams) => {
       init_image: params.initImage,
       mask_image: params.maskImage,
       mask_source:
-        params.maskMode === 'INPAINTING'
+        params.taskType === 'INPAINTING'
           ? 'MASK_IMAGE_BLACK'
           : 'MASK_IMAGE_WHITE',
     };
@@ -418,7 +524,7 @@ const createBodyImageStabilityAI2024Model = (params: GenerateImageParams) => {
     body.prompt = body.prompt + ', ' + params.stylePreset;
   }
 
-  // image-to-image modeの際、aspect比を使用できない
+  // When in image-to-image mode, aspect ratio cannot be used
   if (params.aspectRatio && !params.initImage) {
     body = {
       ...body,
@@ -444,7 +550,7 @@ const createBodyImageStabilityAI2024Model = (params: GenerateImageParams) => {
   return JSON.stringify(body);
 };
 
-const createBodyImageAmazonImage = (params: GenerateImageParams) => {
+const createBodyImageAmazonGeneralImage = (params: GenerateImageParams) => {
   // TODO: Support inpainting and outpainting too
   const imageGenerationConfig = {
     numberOfImages: 1,
@@ -454,8 +560,8 @@ const createBodyImageAmazonImage = (params: GenerateImageParams) => {
     cfgScale: params.cfgScale,
     seed: params.seed % 214783648, // max for titan image
   };
-  let body: Partial<AmazonImageParams> = {};
-  if (params.initImage && params.maskMode === undefined) {
+  let body: Partial<AmazonGeneralImageParams> = {};
+  if (params.initImage && params.taskType === undefined) {
     body = {
       taskType: 'IMAGE_VARIATION',
       imageVariationParams: {
@@ -469,7 +575,7 @@ const createBodyImageAmazonImage = (params: GenerateImageParams) => {
       },
       imageGenerationConfig: imageGenerationConfig,
     };
-  } else if (params.initImage && params.maskMode === 'INPAINTING') {
+  } else if (params.initImage && params.taskType === 'INPAINTING') {
     body = {
       taskType: 'INPAINTING',
       inPaintingParams: {
@@ -484,7 +590,7 @@ const createBodyImageAmazonImage = (params: GenerateImageParams) => {
       },
       imageGenerationConfig: imageGenerationConfig,
     };
-  } else if (params.initImage && params.maskMode === 'OUTPAINTING') {
+  } else if (params.initImage && params.taskType === 'OUTPAINTING') {
     body = {
       taskType: 'OUTPAINTING',
       outPaintingParams: {
@@ -516,17 +622,53 @@ const createBodyImageAmazonImage = (params: GenerateImageParams) => {
   return JSON.stringify(body);
 };
 
+const createBodyImageAmazonAdvancedImage = (params: GenerateImageParams) => {
+  const baseBody = JSON.parse(createBodyImageAmazonGeneralImage(params));
+  let body: Partial<AmazonAdvancedImageParams> = {
+    ...baseBody,
+  };
+
+  if (params.taskType === 'COLOR_GUIDED_GENERATION') {
+    body = {
+      taskType: 'COLOR_GUIDED_GENERATION',
+      colorGuidedGenerationParams: {
+        text: params.textPrompt.find((x) => x.weight > 0)?.text || '',
+        negativeText: params.textPrompt.find((x) => x.weight < 0)?.text,
+        referenceImage: params.initImage,
+        colors: params.colors!,
+      },
+      imageGenerationConfig: body.imageGenerationConfig,
+    };
+  } else if (params.taskType === 'BACKGROUND_REMOVAL') {
+    body = {
+      taskType: 'BACKGROUND_REMOVAL',
+      backgroundRemovalParams: {
+        image: params.initImage!,
+      },
+    };
+  } else if (body.textToImageParams) {
+    // Extension of TEXT_IMAGE task type (Image Conditioning)
+    body.textToImageParams = {
+      ...body.textToImageParams,
+      conditionImage: params.initImage,
+      controlMode: params.controlMode,
+      controlStrength: params.controlStrength,
+    };
+  }
+  return JSON.stringify(body);
+};
+
 const extractOutputImageStableDiffusion = (
   response: BedrockImageGenerationResponse | StabilityAI2024ModelResponse
 ) => {
   if ('result' in response) {
-    // BedrockImageGenerationResponse の場合
+    // BedrockImageGenerationResponse
     if (response.result !== 'success') {
       throw new Error('Failed to invoke model');
     }
     return response.artifacts[0].base64;
   } else {
-    // StabilityAI2024ModelResponse の場合
+    // StabilityAI2024ModelResponse
     throw new Error('Unexpected response type for Stable Diffusion');
   }
 };
@@ -535,19 +677,18 @@ const extractOutputImageStabilityAI2024Model = (
   response: BedrockImageGenerationResponse | StabilityAI2024ModelResponse
 ) => {
   if ('finish_reasons' in response) {
-    // StabilityAI2024ModelResponse の場合
+    // StabilityAI2024ModelResponse
     if (response.finish_reasons[0] !== null) {
       if (response.finish_reasons[0] == 'Filter reason: prompt') {
         throw new Error(
-          response.finish_reasons[0] +
-            ': 日本語のプロンプトには対応していません'
+          response.finish_reasons[0] + ': Japanese prompts are not supported'
         );
       }
       throw new Error(response.finish_reasons[0]);
     }
     return response.images[0];
   } else {
-    // BedrockImageGenerationResponse の場合
+    // BedrockImageGenerationResponse
     throw new Error('Unexpected response type for Stability AI 2024 Model');
   }
 };
@@ -561,7 +702,69 @@ const extractOutputImageAmazonImage = (
     throw new Error('Unexpected response type for Amazon Image');
   }
 };
-// テキスト生成に関する、各のModel のパラメーターや関数の定義
+
+const createBodyVideoNovaReel = (params: GenerateVideoParams) => {
+  return {
+    taskType: 'TEXT_VIDEO',
+    textToVideoParams: {
+      text: params.prompt,
+      images: params.images,
+    },
+    videoGenerationConfig: {
+      durationSeconds: params.durationSeconds,
+      fps: params.fps,
+      dimension: params.dimension,
+      seed: params.seed,
+    },
+  };
+};
+
+const createBodyVideoNovaReelV11 = (params: GenerateVideoParams) => {
+  if (params.taskType === 'TEXT_VIDEO') {
+    return {
+      taskType: 'TEXT_VIDEO',
+      textToVideoParams: {
+        text: params.prompt,
+        images: params.images,
+      },
+      videoGenerationConfig: {
+        durationSeconds: params.durationSeconds,
+        fps: params.fps,
+        dimension: params.dimension,
+        seed: params.seed,
+      },
+    };
+  } else if (params.taskType === 'MULTI_SHOT_AUTOMATED') {
+    return {
+      taskType: 'MULTI_SHOT_AUTOMATED',
+      multiShotAutomatedParams: {
+        text: params.prompt,
+      },
+      videoGenerationConfig: {
+        durationSeconds: params.durationSeconds,
+        fps: params.fps,
+        dimension: params.dimension,
+        seed: params.seed,
+      },
+    };
+  } else if (params.taskType === 'MULTI_SHOT_MANUAL') {
+    throw new Error('Not implemented yet');
+  } else {
+    throw new Error(`Unknown task type ${params.taskType}`);
+  }
+};
+
+const createBodyVideoLumaRayV2 = (params: GenerateVideoParams) => {
+  return {
+    prompt: params.prompt,
+    aspect_ratio: params.aspectRatio,
+    loop: params.loop,
+    duration: `${params.durationSeconds}s`,
+    resolution: params.resolution,
+  };
+};
+
+// Definition of parameters and functions for each model related to text generation
 
 export const BEDROCK_TEXT_GEN_MODELS: {
   [key: string]: {
@@ -570,188 +773,204 @@ export const BEDROCK_TEXT_GEN_MODELS: {
     createConverseCommandInput: (
       messages: UnrecordedMessage[],
       id: string,
-      modelId: string,
+      model: Model,
       defaultParams: ConverseInferenceParams,
       usecaseParams: UsecaseConverseInferenceParams
     ) => ConverseCommandInput;
     createConverseStreamCommandInput: (
       messages: UnrecordedMessage[],
       id: string,
-      modelId: string,
+      model: Model,
       defaultParams: ConverseInferenceParams,
       usecaseParams: UsecaseConverseInferenceParams
     ) => ConverseStreamCommandInput;
-    extractConverseOutputText: (body: ConverseCommandOutput) => string;
-    extractConverseStreamOutputText: (body: ConverseStreamOutput) => string;
+    extractConverseOutput: (body: ConverseCommandOutput) => StreamingChunk;
+    extractConverseStreamOutput: (body: ConverseStreamOutput) => StreamingChunk;
   };
 } = {
   'anthropic.claude-3-5-sonnet-20241022-v2:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.anthropic.claude-3-5-sonnet-20241022-v2:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'apac.anthropic.claude-3-5-sonnet-20241022-v2:0': {
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-3-5-haiku-20241022-v1:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'us.anthropic.claude-3-7-sonnet-20250219-v1:0': {
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.anthropic.claude-3-5-haiku-20241022-v1:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-3-5-sonnet-20240620-v1:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.anthropic.claude-3-5-sonnet-20240620-v1:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'eu.anthropic.claude-3-5-sonnet-20240620-v1:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'apac.anthropic.claude-3-5-sonnet-20240620-v1:0': {
-    defaultParams: CLAUDE_DEFAULT_PARAMS,
+    defaultParams: CLAUDE_3_5_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-3-opus-20240229-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.anthropic.claude-3-opus-20240229-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-3-sonnet-20240229-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.anthropic.claude-3-sonnet-20240229-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'eu.anthropic.claude-3-sonnet-20240229-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'apac.anthropic.claude-3-sonnet-20240229-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-3-haiku-20240307-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.anthropic.claude-3-haiku-20240307-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'eu.anthropic.claude-3-haiku-20240307-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'apac.anthropic.claude-3-haiku-20240307-v1:0': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-v2:1': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-v2': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'anthropic.claude-instant-v1': {
     defaultParams: CLAUDE_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'amazon.titan-text-express-v1': {
     defaultParams: TITAN_TEXT_DEFAULT_PARAMS,
@@ -759,8 +978,8 @@ export const BEDROCK_TEXT_GEN_MODELS: {
     createConverseCommandInput: createConverseCommandInputWithoutSystemContext,
     createConverseStreamCommandInput:
       createConverseStreamCommandInputWithoutSystemContext,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'amazon.titan-text-premier-v1:0': {
     defaultParams: TITAN_TEXT_DEFAULT_PARAMS,
@@ -768,80 +987,88 @@ export const BEDROCK_TEXT_GEN_MODELS: {
     createConverseCommandInput: createConverseCommandInputWithoutSystemContext,
     createConverseStreamCommandInput:
       createConverseStreamCommandInputWithoutSystemContext,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'meta.llama3-8b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'meta.llama3-70b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'meta.llama3-1-8b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'meta.llama3-1-70b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'meta.llama3-1-405b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.meta.llama3-2-1b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.meta.llama3-2-3b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.meta.llama3-2-11b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.meta.llama3-2-90b-instruct-v1:0': {
     defaultParams: LLAMA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'us.meta.llama3-3-70b-instruct-v1:0': {
+    defaultParams: LLAMA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'mistral.mistral-7b-instruct-v0:2': {
     defaultParams: MISTRAL_DEFAULT_PARAMS,
@@ -849,8 +1076,8 @@ export const BEDROCK_TEXT_GEN_MODELS: {
     createConverseCommandInput: createConverseCommandInputWithoutSystemContext,
     createConverseStreamCommandInput:
       createConverseStreamCommandInputWithoutSystemContext,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'mistral.mixtral-8x7b-instruct-v0:1': {
     defaultParams: MIXTRAL_DEFAULT_PARAMS,
@@ -858,48 +1085,64 @@ export const BEDROCK_TEXT_GEN_MODELS: {
     createConverseCommandInput: createConverseCommandInputWithoutSystemContext,
     createConverseStreamCommandInput:
       createConverseStreamCommandInputWithoutSystemContext,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'mistral.mistral-small-2402-v1:0': {
     defaultParams: MISTRAL_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'mistral.mistral-large-2402-v1:0': {
     defaultParams: MISTRAL_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'mistral.mistral-large-2407-v1:0': {
     defaultParams: MISTRAL_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'us.mistral.pixtral-large-2502-v1:0': {
+    defaultParams: MISTRAL_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'eu.mistral.pixtral-large-2502-v1:0': {
+    defaultParams: MISTRAL_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'cohere.command-r-v1:0': {
     defaultParams: COMMANDR_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'cohere.command-r-plus-v1:0': {
     defaultParams: COMMANDR_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
 
   'amazon.nova-pro-v1:0': {
@@ -907,52 +1150,108 @@ export const BEDROCK_TEXT_GEN_MODELS: {
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'amazon.nova-lite-v1:0': {
     defaultParams: NOVA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'amazon.nova-micro-v1:0': {
     defaultParams: NOVA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.amazon.nova-pro-v1:0': {
     defaultParams: NOVA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.amazon.nova-lite-v1:0': {
     defaultParams: NOVA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
   'us.amazon.nova-micro-v1:0': {
     defaultParams: NOVA_DEFAULT_PARAMS,
     usecaseParams: USECASE_DEFAULT_PARAMS,
     createConverseCommandInput: createConverseCommandInput,
     createConverseStreamCommandInput: createConverseStreamCommandInput,
-    extractConverseOutputText: extractConverseOutputText,
-    extractConverseStreamOutputText: extractConverseStreamOutputText,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'eu.amazon.nova-pro-v1:0': {
+    defaultParams: NOVA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'eu.amazon.nova-lite-v1:0': {
+    defaultParams: NOVA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'eu.amazon.nova-micro-v1:0': {
+    defaultParams: NOVA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'apac.amazon.nova-pro-v1:0': {
+    defaultParams: NOVA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'apac.amazon.nova-lite-v1:0': {
+    defaultParams: NOVA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'apac.amazon.nova-micro-v1:0': {
+    defaultParams: NOVA_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
+  },
+  'us.deepseek.r1-v1:0': {
+    defaultParams: DEEPSEEK_DEFAULT_PARAMS,
+    usecaseParams: USECASE_DEFAULT_PARAMS,
+    createConverseCommandInput: createConverseCommandInput,
+    createConverseStreamCommandInput: createConverseStreamCommandInput,
+    extractConverseOutput: extractConverseOutput,
+    extractConverseStreamOutput: extractConverseStreamOutput,
   },
 };
 
-// 画像生成に関する、各のModel のパラメーターや関数の定義
+// Definition of parameters and functions for each image generation model
 
 export const BEDROCK_IMAGE_GEN_MODELS: {
   [key: string]: {
@@ -974,21 +1273,50 @@ export const BEDROCK_IMAGE_GEN_MODELS: {
     createBodyImage: createBodyImageStabilityAI2024Model,
     extractOutputImage: extractOutputImageStabilityAI2024Model,
   },
+  'stability.stable-image-core-v1:1': {
+    createBodyImage: createBodyImageStabilityAI2024Model,
+    extractOutputImage: extractOutputImageStabilityAI2024Model,
+  },
   'stability.stable-image-ultra-v1:0': {
     createBodyImage: createBodyImageStabilityAI2024Model,
     extractOutputImage: extractOutputImageStabilityAI2024Model,
   },
+  'stability.stable-image-ultra-v1:1': {
+    createBodyImage: createBodyImageStabilityAI2024Model,
+    extractOutputImage: extractOutputImageStabilityAI2024Model,
+  },
+  'stability.sd3-5-large-v1:0': {
+    createBodyImage: createBodyImageStabilityAI2024Model,
+    extractOutputImage: extractOutputImageStabilityAI2024Model,
+  },
   'amazon.titan-image-generator-v1': {
-    createBodyImage: createBodyImageAmazonImage,
+    createBodyImage: createBodyImageAmazonGeneralImage,
     extractOutputImage: extractOutputImageAmazonImage,
   },
   'amazon.titan-image-generator-v2:0': {
-    createBodyImage: createBodyImageAmazonImage,
+    createBodyImage: createBodyImageAmazonAdvancedImage,
     extractOutputImage: extractOutputImageAmazonImage,
   },
   'amazon.nova-canvas-v1:0': {
-    createBodyImage: createBodyImageAmazonImage,
+    createBodyImage: createBodyImageAmazonAdvancedImage,
     extractOutputImage: extractOutputImageAmazonImage,
+  },
+};
+
+export const BEDROCK_VIDEO_GEN_MODELS: {
+  [key: string]: {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    createBodyVideo: (params: GenerateVideoParams) => any;
+  };
+} = {
+  'amazon.nova-reel-v1:0': {
+    createBodyVideo: createBodyVideoNovaReel,
+  },
+  'amazon.nova-reel-v1:1': {
+    createBodyVideo: createBodyVideoNovaReelV11,
+  },
+  'luma.ray-v2:0': {
+    createBodyVideo: createBodyVideoLumaRayV2,
   },
 };
 

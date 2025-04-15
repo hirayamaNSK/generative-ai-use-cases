@@ -1,10 +1,10 @@
 import React, { useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ROUTE_INDEX_USE_CASE_BUILDER } from '../../main';
 import {
   SamplePromptType,
-  useCaseBuilderSamplePrompts,
+  getUseCaseBuilderSamplePrompts,
 } from '../../prompts/useCaseBuilderSamples';
+import { useTranslation } from 'react-i18next';
 
 type CardSampleProps = SamplePromptType;
 
@@ -12,7 +12,7 @@ const CardSample: React.FC<CardSampleProps> = (props) => {
   const navigate = useNavigate();
 
   const onClick = useCallback(() => {
-    navigate(`${ROUTE_INDEX_USE_CASE_BUILDER}/new`, {
+    navigate(`/use-case-builder/new`, {
       state: {
         title: props.title,
         promptTemplate: props.promptTemplate,
@@ -78,13 +78,15 @@ const CardSample: React.FC<CardSampleProps> = (props) => {
 };
 
 const UseCaseBuilderSamplesPage: React.FC = () => {
+  const { t } = useTranslation();
+
   return (
     <div className="flex flex-col gap-4 p-4">
       <div className="invisible my-0 flex h-0 items-center justify-center text-xl font-semibold lg:visible lg:h-min print:visible print:h-min">
-        サンプル集
+        {t('useCaseBuilder.samples')}
       </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3">
-        {useCaseBuilderSamplePrompts.map((sample, idx) => {
+        {getUseCaseBuilderSamplePrompts(t).map((sample, idx) => {
           return (
             <CardSample
               key={idx}

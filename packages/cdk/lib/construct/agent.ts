@@ -1,4 +1,4 @@
-import { Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, Lazy, Names, RemovalPolicy } from 'aws-cdk-lib';
 import { Runtime } from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -16,18 +16,25 @@ import {
 } from 'aws-cdk-lib/aws-s3';
 import { BucketDeployment, Source } from 'aws-cdk-lib/aws-s3-deployment';
 import { CfnAgent, CfnAgentAlias } from 'aws-cdk-lib/aws-bedrock';
-import { Agent as AgentType } from 'generative-ai-use-cases-jp';
+import { Agent as AgentType } from 'generative-ai-use-cases';
+
+interface AgentProps {
+  // Context Params
+  searchAgentEnabled: boolean;
+  searchApiKey?: string | null;
+}
 
 export class Agent extends Construct {
-  public readonly agents: AgentType[];
+  public readonly agents: AgentType[] = [];
 
-  constructor(scope: Construct, id: string) {
+  constructor(scope: Construct, id: string, props: AgentProps) {
     super(scope, id);
 
-    // search api
-    const searchApiKey = this.node.tryGetContext('searchApiKey') || '';
+    const suffix = Lazy.string({ produce: () => Names.uniqueId(this) });
 
-    // agents for bedrock の schema やデータを配置するバケット
+    const { searchAgentEnabled, searchApiKey } = props;
+
+    // Bucket to store schema and data for agents for bedrock
     const s3Bucket = new Bucket(this, 'Bucket', {
       encryption: BucketEncryption.S3_MANAGED,
       removalPolicy: RemovalPolicy.DESTROY,
@@ -36,25 +43,12 @@ export class Agent extends Construct {
       blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
     });
 
-    // schema を s3 に配置
+    // Deploy schema to s3
     const schema = new BucketDeployment(this, 'ApiSchemaBucket', {
       sources: [Source.asset('assets/api-schema')],
       destinationBucket: s3Bucket,
       destinationKeyPrefix: 'api-schema',
     });
-
-    // Lambda
-    const bedrockAgentLambda = new NodejsFunction(this, 'BedrockAgentLambda', {
-      runtime: Runtime.NODEJS_18_X,
-      entry: './lambda/agent.ts',
-      timeout: Duration.seconds(300),
-      environment: {
-        SEARCH_API_KEY: searchApiKey,
-      },
-    });
-    bedrockAgentLambda.grantInvoke(
-      new ServicePrincipal('bedrock.amazonaws.com')
-    );
 
     // Agent
     const bedrockAgentRole = new Role(this, 'BedrockAgentRole', {
@@ -81,43 +75,80 @@ export class Agent extends Construct {
       },
     });
 
-    const searchAgent = new CfnAgent(this, 'SearchAgent', {
-      agentName: `SearchEngineAgent-${id}`,
-      actionGroups: [
+    // Search Agent
+    if (searchAgentEnabled && searchApiKey) {
+      const bedrockAgentLambda = new NodejsFunction(
+        this,
+        'BedrockAgentLambda',
         {
-          actionGroupName: 'Search',
-          actionGroupExecutor: {
-            lambda: bedrockAgentLambda.functionArn,
+          runtime: Runtime.NODEJS_LATEST,
+          entry: './lambda/agent.ts',
+          timeout: Duration.seconds(300),
+          environment: {
+            SEARCH_API_KEY: searchApiKey ?? '',
           },
-          apiSchema: {
-            s3: {
-              s3BucketName: schema.deployedBucket.bucketName,
-              s3ObjectKey: 'api-schema/api-schema.json',
+        }
+      );
+      bedrockAgentLambda.grantInvoke(
+        new ServicePrincipal('bedrock.amazonaws.com')
+      );
+
+      const searchAgent = new CfnAgent(this, 'SearchAgent', {
+        agentName: `SearchEngineAgent-${suffix}`,
+        actionGroups: [
+          {
+            actionGroupName: 'Search',
+            actionGroupExecutor: {
+              lambda: bedrockAgentLambda.functionArn,
             },
+            apiSchema: {
+              s3: {
+                s3BucketName: schema.deployedBucket.bucketName,
+                s3ObjectKey: 'api-schema/api-schema.json',
+              },
+            },
+            description: 'Search',
           },
-          description: 'Search',
-        },
-        {
-          actionGroupName: 'UserInput',
-          parentActionGroupSignature: 'AMAZON.UserInput',
-        },
-      ],
-      agentResourceRoleArn: bedrockAgentRole.roleArn,
-      idleSessionTtlInSeconds: 3600,
-      autoPrepare: true,
-      description: 'Search Agent',
-      foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0',
-      instruction:
-        'あなたは指示に応えるアシスタントです。 指示に応えるために必要な情報が十分な場合はすぐに回答し、不十分な場合は検索を行い必要な情報を入手し回答してください。複数回検索することが可能です。',
-    });
+          {
+            actionGroupName: 'UserInputAction',
+            parentActionGroupSignature: 'AMAZON.UserInput',
+          },
+        ],
+        agentResourceRoleArn: bedrockAgentRole.roleArn,
+        idleSessionTtlInSeconds: 3600,
+        autoPrepare: true,
+        description: 'Search Agent',
+        foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0',
+        instruction: `You are an advanced assistant with the ability to search and retrieve information from the web to perform complex research tasks.
+Your main function is to solve problems and meet user requests by utilizing these capabilities.
+Your main characteristics and instructions are as follows.
 
-    const searchAgentAlias = new CfnAgentAlias(this, 'SearchAgentAlias', {
-      agentId: searchAgent.attrAgentId,
-      agentAliasName: 'v1',
-    });
+- Understand the user's request and construct hypothesis on research strategy. If the user's request is not clear, ask the user for more information.
+- Think right search keywords to retrieve information relevant to the user's request.
+- Search the web for information relevant to the user's request.
+- Retrieve information from the web to answer the user's request.
+- If the information needed to respond to the instruction is sufficient, answer immediately.
+- If the information is insufficient, revise research strategy and collect more information.
+- Multiple searches are possible. You can search up to 5 times.
 
+Automatically detect the language of the user's request and think and answer in the same language.`,
+      });
+
+      const searchAgentAlias = new CfnAgentAlias(this, 'SearchAgentAlias', {
+        agentId: searchAgent.attrAgentId,
+        agentAliasName: 'v1',
+      });
+
+      this.agents.push({
+        displayName: 'SearchEngine',
+        agentId: searchAgent.attrAgentId,
+        aliasId: searchAgentAlias.attrAgentAliasId,
+      });
+    }
+
+    // Code Interpreter Agent
     const codeInterpreterAgent = new CfnAgent(this, 'CodeInterpreterAgent', {
-      agentName: `CodeInterpreterAgent-${id}`,
+      agentName: `CodeInterpreterAgent-${suffix}`,
       actionGroups: [
         {
           actionGroupName: 'CodeInterpreter',
@@ -129,37 +160,42 @@ export class Agent extends Construct {
       autoPrepare: true,
       description: 'Code Interpreter',
       foundationModel: 'anthropic.claude-3-sonnet-20240229-v1:0',
-      instruction: `あなたは、コード実行、チャート生成、複雑なデータ分析の機能を持つ高度な AI エージェントです。あなたの主な機能は、これらの機能を活用して問題を解決し、ユーザーの要求を満たすことです。あなたの主な特性と指示は次のとおりです。
+      instruction: `You are an advanced AI agent with the ability to execute code, generate charts, and perform complex data analysis. 
+Your main function is to solve problems and meet user requests by utilizing these capabilities.
+Your main characteristics and instructions are as follows.
 
-コード実行:
-- リアルタイムで Python 環境にアクセスし、コードを記述および実行できます。
-- 計算やデータ操作を求められた場合は、常に正確性を確保するためにこのコード実行機能を使用してください。
-- コードを実行した後、正確な出力を報告し、結果を説明してください。
+Code Execution:
+- Access the Python environment in real time to write and run code.
+- When asked to perform calculations or data operations, always use this code execution feature to ensure accuracy.
+- After running the code, report the exact output and explain the results.
 
-データ分析:
-- 統計分析、データ可視化、機械学習アプリケーションなど、複雑なデータ分析タスクに優れています。
-- 問題を理解し、データを準備し、分析を実行し、結果を解釈するなど、体系的にデータ分析タスクに取り組んでください。
+Data Analysis:
+- You are excellent at statistical analysis, data visualization, machine learning applications, and other complex data analysis tasks.
+- Understand the problem, prepare the data, perform the analysis, and interpret the results systematically.
 
-問題解決アプローチ:
-- 問題や要求が提示された場合は、それを段階に分けてください。
-- 考え方のプロセスと取っている手順を明確に伝えてください。
-- タスクが複数の手順やツールを必要とする場合は、開始前にアプローチを概説してください。
+Problem Solving Approach:
+- When a problem or request is presented, break it down into steps.
+- Clearly communicate the process and steps taken.
+- If a task requires multiple steps or tools, outline the approach before starting.
 
-透明性と正確性:
-- 自分が何をしているかを常に明確にしてください。コードを実行する場合は、そのことを伝えてください。画像を生成する場合は、その旨を説明してください。
-- 何かを確信できない場合や、タスクが自分の能力を超えている場合は、はっきりとそのことを伝えてください。
-- 仮説的な結果を実際の結果として提示しないでください。コード実行や画像生成から得られた実際の結果のみを報告してください。
+Transparency and Accuracy:
+- Always clarify what you are doing. If you are executing code, inform the user. If you are generating an image, explain that.
+- If you are unsure about something or the task exceeds your capabilities, clearly communicate that.
+- Do not present hypothetical results as actual results. Only report actual results from code execution or image generation.
 
-対話スタイル:
-- 単純な質問には簡潔に、複雑なタスクには詳細な説明を提供してください。
-- 適切に専門用語を使いますが、分かりやすい説明を求められた場合は、簡単な言葉で説明する準備をしてください。
-- 役立つ関連情報や代替アプローチを積極的に提案してください。
+Dialog Style:
+- Provide a concise answer to simple questions and a detailed explanation for complex tasks.
+- Use appropriate technical terms, but be prepared to explain in simple terms if requested.
+- Actively propose useful related information or alternative approaches.
 
-継続的改善:
-- タスクを完了した後、ユーザーに説明が必要かどうか、フォローアップの質問があるかどうかを尋ねてください。
-- フィードバックに耳を傾け、それに応じてアプローチを調整してください。
+Continuous Improvement:
+- After completing a task, ask the user if they need an explanation.
+- Listen to feedback and adjust the approach accordingly.
 
-あなたの目標は、コード実行、画像生成、データ分析の独自の機能を活用して、正確で役立つ洞察に富む支援を提供することです。ユーザーの要求に対して、最も実用的で効果的な解決策を提供するよう常に努めてください。`,
+Your goal is to provide support that is accurate and useful by utilizing the unique features of code execution, image generation, and data analysis.
+Always strive to provide the most practical and effective solutions to user requests.
+
+Automatically detect the language of the user's request and think and answer in the same language.`,
     });
 
     const codeInterpreterAgentAlias = new CfnAgentAlias(
@@ -171,17 +207,10 @@ export class Agent extends Construct {
       }
     );
 
-    this.agents = [
-      {
-        displayName: 'SearchEngine',
-        agentId: searchAgent.attrAgentId,
-        aliasId: searchAgentAlias.attrAgentAliasId,
-      },
-      {
-        displayName: 'CodeInterpreter',
-        agentId: codeInterpreterAgent.attrAgentId,
-        aliasId: codeInterpreterAgentAlias.attrAgentAliasId,
-      },
-    ];
+    this.agents.push({
+      displayName: 'CodeInterpreter',
+      agentId: codeInterpreterAgent.attrAgentId,
+      aliasId: codeInterpreterAgentAlias.attrAgentAliasId,
+    });
   }
 }

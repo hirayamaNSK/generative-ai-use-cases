@@ -7,7 +7,7 @@ import {
   RestApi,
   ResponseType,
 } from 'aws-cdk-lib/aws-apigateway';
-import { UserPool } from 'aws-cdk-lib/aws-cognito';
+import { UserPool, UserPoolClient } from 'aws-cdk-lib/aws-cognito';
 import { IFunction, Runtime } from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -20,13 +20,33 @@ import {
   BucketEncryption,
   HttpMethods,
 } from 'aws-cdk-lib/aws-s3';
-import { Agent, AgentMap } from 'generative-ai-use-cases-jp';
-import { modelFeatureFlags } from '@generative-ai-use-cases-jp/common';
+import { Agent, AgentMap, ModelConfiguration } from 'generative-ai-use-cases';
+import {
+  BEDROCK_IMAGE_GEN_MODELS,
+  BEDROCK_VIDEO_GEN_MODELS,
+  BEDROCK_RERANKING_MODELS,
+  BEDROCK_TEXT_MODELS,
+} from '@generative-ai-use-cases/common';
 
 export interface BackendApiProps {
+  // Context Params
+  modelRegion: string;
+  modelIds: ModelConfiguration[];
+  imageGenerationModelIds: ModelConfiguration[];
+  videoGenerationModelIds: ModelConfiguration[];
+  videoBucketRegionMap: Record<string, string>;
+  endpointNames: string[];
+  queryDecompositionEnabled: boolean;
+  rerankingModelId?: string | null;
+  customAgents: Agent[];
+  crossAccountBedrockRoleArn?: string | null;
+
+  // Resource
   userPool: UserPool;
   idPool: IdentityPool;
+  userPoolClient: UserPoolClient;
   table: Table;
+  knowledgeBaseId?: string;
   agents?: Agent[];
   guardrailIdentify?: string;
   guardrailVersion?: string;
@@ -35,53 +55,61 @@ export interface BackendApiProps {
 export class Api extends Construct {
   readonly api: RestApi;
   readonly predictStreamFunction: NodejsFunction;
-  readonly invokePromptFlowFunction: NodejsFunction;
+  readonly invokeFlowFunction: NodejsFunction;
   readonly optimizePromptFunction: NodejsFunction;
   readonly modelRegion: string;
-  readonly modelIds: string[];
-  readonly imageGenerationModelIds: string[];
+  readonly modelIds: ModelConfiguration[];
+  readonly imageGenerationModelIds: ModelConfiguration[];
+  readonly videoGenerationModelIds: ModelConfiguration[];
   readonly endpointNames: string[];
   readonly agentNames: string[];
-  readonly crossAccountBedrockRoleArn: string;
   readonly fileBucket: Bucket;
   readonly getFileDownloadSignedUrlFunction: IFunction;
 
   constructor(scope: Construct, id: string, props: BackendApiProps) {
     super(scope, id);
 
-    const { userPool, table, idPool } = props;
-
-    // region for bedrock / sagemaker
-    const modelRegion = this.node.tryGetContext('modelRegion') || 'us-east-1';
-    // region for bedrock agent
-    const agentRegion = this.node.tryGetContext('agentRegion') || 'us-east-1';
-
-    // Model IDs
-    const modelIds: string[] = this.node.tryGetContext('modelIds') || [
-      'anthropic.claude-3-sonnet-20240229-v1:0',
-    ];
-    const imageGenerationModelIds: string[] = this.node.tryGetContext(
-      'imageGenerationModelIds'
-    ) || ['stability.stable-diffusion-xl-v1'];
-    const endpointNames: string[] =
-      this.node.tryGetContext('endpointNames') || [];
-    const agents: Agent[] = [
-      ...(props.agents || []),
-      ...(this.node.tryGetContext('agents') || []),
-    ];
+    const {
+      modelRegion,
+      modelIds,
+      imageGenerationModelIds,
+      videoGenerationModelIds,
+      endpointNames,
+      crossAccountBedrockRoleArn,
+      userPool,
+      userPoolClient,
+      table,
+      idPool,
+      knowledgeBaseId,
+      queryDecompositionEnabled,
+      rerankingModelId,
+    } = props;
+    const agents: Agent[] = [...(props.agents ?? []), ...props.customAgents];
 
     // Validate Model Names
-    const supportedModelIds = Object.keys(modelFeatureFlags);
-    for (const modelId of modelIds) {
-      if (!supportedModelIds.includes(modelId)) {
-        throw new Error(`Unsupported Model Name: ${modelId}`);
+    for (const model of modelIds) {
+      if (!BEDROCK_TEXT_MODELS.includes(model.modelId)) {
+        throw new Error(`Unsupported Model Name: ${model.modelId}`);
       }
     }
-    for (const modelId of imageGenerationModelIds) {
-      if (!supportedModelIds.includes(modelId)) {
-        throw new Error(`Unsupported Model Name: ${modelId}`);
+    for (const model of imageGenerationModelIds) {
+      if (!BEDROCK_IMAGE_GEN_MODELS.includes(model.modelId)) {
+        throw new Error(`Unsupported Model Name: ${model.modelId}`);
       }
     }
+    for (const model of videoGenerationModelIds) {
+      if (!BEDROCK_VIDEO_GEN_MODELS.includes(model.modelId)) {
+        throw new Error(`Unsupported Model Name: ${model.modelId}`);
+      }
+    }
+    if (
+      rerankingModelId &&
+      !BEDROCK_RERANKING_MODELS.includes(rerankingModelId)
+    ) {
+      throw new Error(`Unsupported Model Name: ${rerankingModelId}`);
+    }
+
+    // Agent Map
     const agentMap: AgentMap = {};
     for (const agent of agents) {
       agentMap[agent.displayName] = {
@@ -106,21 +134,17 @@ export class Api extends Construct {
       maxAge: 3000,
     });
 
-    // cross account access IAM role
-    const crossAccountBedrockRoleArn = this.node.tryGetContext(
-      'crossAccountBedrockRoleArn'
-    );
-
     // Lambda
     const predictFunction = new NodejsFunction(this, 'Predict', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/predict.ts',
       timeout: Duration.minutes(15),
       environment: {
         MODEL_REGION: modelRegion,
         MODEL_IDS: JSON.stringify(modelIds),
         IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
-        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn,
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
+        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn ?? '',
         ...(props.guardrailIdentify
           ? { GUARDRAIL_IDENTIFIER: props.guardrailIdentify }
           : {}),
@@ -134,61 +158,61 @@ export class Api extends Construct {
     });
 
     const predictStreamFunction = new NodejsFunction(this, 'PredictStream', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/predictStream.ts',
       timeout: Duration.minutes(15),
       memorySize: 256,
       environment: {
+        USER_POOL_ID: userPool.userPoolId,
+        USER_POOL_CLIENT_ID: userPoolClient.userPoolClientId,
         MODEL_REGION: modelRegion,
         MODEL_IDS: JSON.stringify(modelIds),
         IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
-        AGENT_REGION: agentRegion,
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
         AGENT_MAP: JSON.stringify(agentMap),
-        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn,
+        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn ?? '',
         BUCKET_NAME: fileBucket.bucketName,
+        KNOWLEDGE_BASE_ID: knowledgeBaseId ?? '',
         ...(props.guardrailIdentify
           ? { GUARDRAIL_IDENTIFIER: props.guardrailIdentify }
           : {}),
         ...(props.guardrailVersion
           ? { GUARDRAIL_VERSION: props.guardrailVersion }
           : {}),
+        QUERY_DECOMPOSITION_ENABLED: JSON.stringify(queryDecompositionEnabled),
+        RERANKING_MODEL_ID: rerankingModelId ?? '',
       },
       bundling: {
         nodeModules: [
           '@aws-sdk/client-bedrock-runtime',
           '@aws-sdk/client-bedrock-agent-runtime',
-          // デフォルトの client-sagemaker-runtime のバージョンは StreamingResponse に
-          // 対応していないため package.json に記載のバージョンを Bundle する
+          // The default version of client-sagemaker-runtime does not support StreamingResponse, so specify the version in package.json for bundling
           '@aws-sdk/client-sagemaker-runtime',
         ],
       },
     });
-    fileBucket.grantWrite(predictStreamFunction);
+    fileBucket.grantReadWrite(predictStreamFunction);
     predictStreamFunction.grantInvoke(idPool.authenticatedRole);
 
-    // Prompt Flow Lambda Function の追加
-    const invokePromptFlowFunction = new NodejsFunction(
-      this,
-      'InvokePromptFlow',
-      {
-        runtime: Runtime.NODEJS_18_X,
-        entry: './lambda/invokeFlow.ts',
-        timeout: Duration.minutes(15),
-        bundling: {
-          nodeModules: [
-            '@aws-sdk/client-bedrock-runtime',
-            '@aws-sdk/client-bedrock-agent-runtime',
-          ],
-        },
-        environment: {
-          MODEL_REGION: modelRegion,
-        },
-      }
-    );
-    invokePromptFlowFunction.grantInvoke(idPool.authenticatedRole);
+    // Add Flow Lambda Function
+    const invokeFlowFunction = new NodejsFunction(this, 'InvokeFlow', {
+      runtime: Runtime.NODEJS_LATEST,
+      entry: './lambda/invokeFlow.ts',
+      timeout: Duration.minutes(15),
+      bundling: {
+        nodeModules: [
+          '@aws-sdk/client-bedrock-runtime',
+          '@aws-sdk/client-bedrock-agent-runtime',
+        ],
+      },
+      environment: {
+        MODEL_REGION: modelRegion,
+      },
+    });
+    invokeFlowFunction.grantInvoke(idPool.authenticatedRole);
 
     const predictTitleFunction = new NodejsFunction(this, 'PredictTitle', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/predictTitle.ts',
       timeout: Duration.minutes(15),
       bundling: {
@@ -199,7 +223,8 @@ export class Api extends Construct {
         MODEL_REGION: modelRegion,
         MODEL_IDS: JSON.stringify(modelIds),
         IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
-        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn,
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
+        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn ?? '',
         ...(props.guardrailIdentify
           ? { GUARDRAIL_IDENTIFIER: props.guardrailIdentify }
           : {}),
@@ -211,25 +236,106 @@ export class Api extends Construct {
     table.grantWriteData(predictTitleFunction);
 
     const generateImageFunction = new NodejsFunction(this, 'GenerateImage', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/generateImage.ts',
       timeout: Duration.minutes(15),
       environment: {
         MODEL_REGION: modelRegion,
         MODEL_IDS: JSON.stringify(modelIds),
         IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
-        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn,
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
+        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn ?? '',
       },
       bundling: {
         nodeModules: ['@aws-sdk/client-bedrock-runtime'],
       },
     });
 
+    const generateVideoFunction = new NodejsFunction(this, 'GenerateVideo', {
+      runtime: Runtime.NODEJS_LATEST,
+      entry: './lambda/generateVideo.ts',
+      timeout: Duration.minutes(15),
+      environment: {
+        MODEL_REGION: modelRegion,
+        MODEL_IDS: JSON.stringify(modelIds),
+        IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
+        VIDEO_BUCKET_REGION_MAP: JSON.stringify(props.videoBucketRegionMap),
+        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn ?? '',
+        BUCKET_NAME: fileBucket.bucketName,
+        TABLE_NAME: table.tableName,
+      },
+      bundling: {
+        nodeModules: ['@aws-sdk/client-bedrock-runtime'],
+      },
+    });
+    for (const region of Object.keys(props.videoBucketRegionMap)) {
+      const bucketName = props.videoBucketRegionMap[region];
+      generateVideoFunction.role?.addToPrincipalPolicy(
+        new PolicyStatement({
+          effect: Effect.ALLOW,
+          actions: ['s3:PutObject'],
+          resources: [
+            `arn:aws:s3:::${bucketName}`,
+            `arn:aws:s3:::${bucketName}/*`,
+          ],
+        })
+      );
+    }
+    table.grantWriteData(generateVideoFunction);
+
+    const listVideoJobs = new NodejsFunction(this, 'ListVideoJobs', {
+      runtime: Runtime.NODEJS_LATEST,
+      entry: './lambda/listVideoJobs.ts',
+      timeout: Duration.minutes(15),
+      environment: {
+        MODEL_REGION: modelRegion,
+        MODEL_IDS: JSON.stringify(modelIds),
+        IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
+        VIDEO_BUCKET_REGION_MAP: JSON.stringify(props.videoBucketRegionMap),
+        CROSS_ACCOUNT_BEDROCK_ROLE_ARN: crossAccountBedrockRoleArn ?? '',
+        BUCKET_NAME: fileBucket.bucketName,
+        TABLE_NAME: table.tableName,
+      },
+      bundling: {
+        nodeModules: ['@aws-sdk/client-bedrock-runtime'],
+      },
+    });
+    for (const region of Object.keys(props.videoBucketRegionMap)) {
+      const bucketName = props.videoBucketRegionMap[region];
+      listVideoJobs.role?.addToPrincipalPolicy(
+        new PolicyStatement({
+          effect: Effect.ALLOW,
+          actions: ['s3:GetObject', 's3:DeleteObject', 's3:ListBucket'],
+          resources: [
+            `arn:aws:s3:::${bucketName}`,
+            `arn:aws:s3:::${bucketName}/*`,
+          ],
+        })
+      );
+    }
+    fileBucket.grantWrite(listVideoJobs);
+    table.grantReadWriteData(listVideoJobs);
+
+    const deleteVideoJob = new NodejsFunction(this, 'DeleteVideoJob', {
+      runtime: Runtime.NODEJS_LATEST,
+      entry: './lambda/deleteVideoJob.ts',
+      timeout: Duration.minutes(15),
+      environment: {
+        MODEL_IDS: JSON.stringify(modelIds),
+        IMAGE_GENERATION_MODEL_IDS: JSON.stringify(imageGenerationModelIds),
+        VIDEO_GENERATION_MODEL_IDS: JSON.stringify(videoGenerationModelIds),
+        TABLE_NAME: table.tableName,
+      },
+    });
+    table.grantWriteData(deleteVideoJob);
+
     const optimizePromptFunction = new NodejsFunction(
       this,
       'OptimizePromptFunction',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/optimizePrompt.ts',
         timeout: Duration.minutes(15),
         bundling: {
@@ -242,7 +348,7 @@ export class Api extends Construct {
     );
     optimizePromptFunction.grantInvoke(idPool.authenticatedRole);
 
-    // SageMaker Endpoint がある場合は権限付与
+    // If SageMaker Endpoint exists, grant permission
     if (endpointNames.length > 0) {
       // SageMaker Policy
       const sagemakerPolicy = new PolicyStatement({
@@ -259,10 +365,12 @@ export class Api extends Construct {
       predictStreamFunction.role?.addToPrincipalPolicy(sagemakerPolicy);
       predictTitleFunction.role?.addToPrincipalPolicy(sagemakerPolicy);
       generateImageFunction.role?.addToPrincipalPolicy(sagemakerPolicy);
-      invokePromptFlowFunction.role?.addToPrincipalPolicy(sagemakerPolicy);
+      generateVideoFunction.role?.addToPrincipalPolicy(sagemakerPolicy);
+      listVideoJobs.role?.addToPrincipalPolicy(sagemakerPolicy);
+      invokeFlowFunction.role?.addToPrincipalPolicy(sagemakerPolicy);
     }
 
-    // Bedrock は常に権限付与
+    // Bedrock is always granted permission
     // Bedrock Policy
     if (
       typeof crossAccountBedrockRoleArn !== 'string' ||
@@ -277,10 +385,12 @@ export class Api extends Construct {
       predictFunction.role?.addToPrincipalPolicy(bedrockPolicy);
       predictTitleFunction.role?.addToPrincipalPolicy(bedrockPolicy);
       generateImageFunction.role?.addToPrincipalPolicy(bedrockPolicy);
-      invokePromptFlowFunction.role?.addToPrincipalPolicy(bedrockPolicy);
+      generateVideoFunction.role?.addToPrincipalPolicy(bedrockPolicy);
+      listVideoJobs.role?.addToPrincipalPolicy(bedrockPolicy);
+      invokeFlowFunction.role?.addToPrincipalPolicy(bedrockPolicy);
       optimizePromptFunction.role?.addToPrincipalPolicy(bedrockPolicy);
     } else {
-      // crossAccountBedrockRoleArn が指定されている場合のポリシー
+      // Policy for when crossAccountBedrockRoleArn is specified
       const logsPolicy = new PolicyStatement({
         effect: Effect.ALLOW,
         actions: ['logs:*'],
@@ -295,14 +405,18 @@ export class Api extends Construct {
       predictFunction.role?.addToPrincipalPolicy(logsPolicy);
       predictTitleFunction.role?.addToPrincipalPolicy(logsPolicy);
       generateImageFunction.role?.addToPrincipalPolicy(logsPolicy);
+      generateVideoFunction.role?.addToPrincipalPolicy(logsPolicy);
+      listVideoJobs.role?.addToPrincipalPolicy(logsPolicy);
       predictStreamFunction.role?.addToPrincipalPolicy(assumeRolePolicy);
       predictFunction.role?.addToPrincipalPolicy(assumeRolePolicy);
       predictTitleFunction.role?.addToPrincipalPolicy(assumeRolePolicy);
       generateImageFunction.role?.addToPrincipalPolicy(assumeRolePolicy);
+      generateVideoFunction.role?.addToPrincipalPolicy(assumeRolePolicy);
+      listVideoJobs.role?.addToPrincipalPolicy(assumeRolePolicy);
     }
 
     const createChatFunction = new NodejsFunction(this, 'CreateChat', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/createChat.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -312,7 +426,7 @@ export class Api extends Construct {
     table.grantWriteData(createChatFunction);
 
     const deleteChatFunction = new NodejsFunction(this, 'DeleteChat', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/deleteChat.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -322,7 +436,7 @@ export class Api extends Construct {
     table.grantReadWriteData(deleteChatFunction);
 
     const createMessagesFunction = new NodejsFunction(this, 'CreateMessages', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/createMessages.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -335,7 +449,7 @@ export class Api extends Construct {
       this,
       'UpdateChatTitle',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/updateTitle.ts',
         timeout: Duration.minutes(15),
         environment: {
@@ -346,7 +460,7 @@ export class Api extends Construct {
     table.grantReadWriteData(updateChatTitleFunction);
 
     const listChatsFunction = new NodejsFunction(this, 'ListChats', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/listChats.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -356,7 +470,7 @@ export class Api extends Construct {
     table.grantReadData(listChatsFunction);
 
     const findChatbyIdFunction = new NodejsFunction(this, 'FindChatbyId', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/findChatById.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -366,7 +480,7 @@ export class Api extends Construct {
     table.grantReadData(findChatbyIdFunction);
 
     const listMessagesFunction = new NodejsFunction(this, 'ListMessages', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/listMessages.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -376,7 +490,7 @@ export class Api extends Construct {
     table.grantReadData(listMessagesFunction);
 
     const updateFeedbackFunction = new NodejsFunction(this, 'UpdateFeedback', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/updateFeedback.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -386,13 +500,13 @@ export class Api extends Construct {
     table.grantWriteData(updateFeedbackFunction);
 
     const getWebTextFunction = new NodejsFunction(this, 'GetWebText', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/getWebText.ts',
       timeout: Duration.minutes(15),
     });
 
     const createShareId = new NodejsFunction(this, 'CreateShareId', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/createShareId.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -402,7 +516,7 @@ export class Api extends Construct {
     table.grantWriteData(createShareId);
 
     const getSharedChat = new NodejsFunction(this, 'GetSharedChat', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/getSharedChat.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -412,7 +526,7 @@ export class Api extends Construct {
     table.grantReadData(getSharedChat);
 
     const findShareId = new NodejsFunction(this, 'FindShareId', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/findShareId.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -422,7 +536,7 @@ export class Api extends Construct {
     table.grantReadData(findShareId);
 
     const deleteShareId = new NodejsFunction(this, 'DeleteShareId', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/deleteShareId.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -435,7 +549,7 @@ export class Api extends Construct {
       this,
       'ListSystemContexts',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/listSystemContexts.ts',
         timeout: Duration.minutes(15),
         environment: {
@@ -449,7 +563,7 @@ export class Api extends Construct {
       this,
       'CreateSystemContexts',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/createSystemContext.ts',
         timeout: Duration.minutes(15),
         environment: {
@@ -463,7 +577,7 @@ export class Api extends Construct {
       this,
       'UpdateSystemContextTitle',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/updateSystemContextTitle.ts',
         timeout: Duration.minutes(15),
         environment: {
@@ -477,7 +591,7 @@ export class Api extends Construct {
       this,
       'DeleteSystemContexts',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/deleteSystemContext.ts',
         timeout: Duration.minutes(15),
         environment: {
@@ -488,7 +602,7 @@ export class Api extends Construct {
     table.grantReadWriteData(deleteSystemContextFunction);
 
     const getSignedUrlFunction = new NodejsFunction(this, 'GetSignedUrl', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/getFileUploadSignedUrl.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -501,7 +615,7 @@ export class Api extends Construct {
       this,
       'GetFileDownloadSignedUrlFunction',
       {
-        runtime: Runtime.NODEJS_18_X,
+        runtime: Runtime.NODEJS_LATEST,
         entry: './lambda/getFileDownloadSignedUrl.ts',
         timeout: Duration.minutes(15),
       }
@@ -509,7 +623,7 @@ export class Api extends Construct {
     fileBucket.grantRead(getFileDownloadSignedUrlFunction);
 
     const deleteFileFunction = new NodejsFunction(this, 'DeleteFileFunction', {
-      runtime: Runtime.NODEJS_18_X,
+      runtime: Runtime.NODEJS_LATEST,
       entry: './lambda/deleteFile.ts',
       timeout: Duration.minutes(15),
       environment: {
@@ -681,7 +795,29 @@ export class Api extends Construct {
       commonAuthorizerProps
     );
 
-    // Web コンテンツ抽出のユースケースで利用
+    const videoResource = api.root.addResource('video');
+    const videoGenerateResource = videoResource.addResource('generate');
+    // POST: /video/generate
+    videoGenerateResource.addMethod(
+      'POST',
+      new LambdaIntegration(generateVideoFunction),
+      commonAuthorizerProps
+    );
+    // GET: /video/generate
+    videoGenerateResource.addMethod(
+      'GET',
+      new LambdaIntegration(listVideoJobs),
+      commonAuthorizerProps
+    );
+    const videoJobResource = videoGenerateResource.addResource('{createdDate}');
+    // DELETE: /video/generate/{createdDate}
+    videoJobResource.addMethod(
+      'DELETE',
+      new LambdaIntegration(deleteVideoJob),
+      commonAuthorizerProps
+    );
+
+    // Used in the web content extraction use case
     const webTextResource = api.root.addResource('web-text');
     // GET: /web-text
     webTextResource.addMethod(
@@ -747,18 +883,19 @@ export class Api extends Construct {
 
     this.api = api;
     this.predictStreamFunction = predictStreamFunction;
-    this.invokePromptFlowFunction = invokePromptFlowFunction;
+    this.invokeFlowFunction = invokeFlowFunction;
     this.optimizePromptFunction = optimizePromptFunction;
     this.modelRegion = modelRegion;
     this.modelIds = modelIds;
     this.imageGenerationModelIds = imageGenerationModelIds;
+    this.videoGenerationModelIds = videoGenerationModelIds;
     this.endpointNames = endpointNames;
     this.agentNames = Object.keys(agentMap);
     this.fileBucket = fileBucket;
     this.getFileDownloadSignedUrlFunction = getFileDownloadSignedUrlFunction;
   }
 
-  // Bucket 名を指定してダウンロード可能にする
+  // Allow download by specifying bucket name
   allowDownloadFile(bucketName: string) {
     this.getFileDownloadSignedUrlFunction.role?.addToPrincipalPolicy(
       new PolicyStatement({

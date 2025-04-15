@@ -15,9 +15,9 @@ import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 
 export interface AuthProps {
   selfSignUpEnabled: boolean;
-  allowedIpV4AddressRanges: string[] | null;
-  allowedIpV6AddressRanges: string[] | null;
-  allowedSignUpEmailDomains: string[] | null | undefined;
+  allowedIpV4AddressRanges?: string[] | null;
+  allowedIpV6AddressRanges?: string[] | null;
+  allowedSignUpEmailDomains?: string[] | null;
   samlAuthEnabled: boolean;
 }
 
@@ -30,7 +30,7 @@ export class Auth extends Construct {
     super(scope, id);
 
     const userPool = new UserPool(this, 'UserPool', {
-      // SAML 認証を有効化する場合、UserPool を利用したセルフサインアップは利用しない。セキュリティを意識して閉じる。
+      // If SAML authentication is enabled, do not use self-sign-up with UserPool. Be aware of security.
       selfSignUpEnabled: props.samlAuthEnabled
         ? false
         : props.selfSignUpEnabled,
@@ -107,7 +107,7 @@ export class Auth extends Construct {
         this,
         'CheckEmailDomain',
         {
-          runtime: Runtime.NODEJS_18_X,
+          runtime: Runtime.NODEJS_LATEST,
           entry: './lambda/checkEmailDomain.ts',
           timeout: Duration.minutes(15),
           environment: {

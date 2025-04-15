@@ -6,18 +6,21 @@ import ButtonFeedback from './ButtonFeedback';
 import ButtonIcon from './ButtonIcon';
 import ZoomUpImage from './ZoomUpImage';
 import ZoomUpVideo from './ZoomUpVideo';
-import { PiUserFill, PiChalkboardTeacher, PiFloppyDisk } from 'react-icons/pi';
-import { BaseProps } from '../@types/common';
 import {
-  ShownMessage,
-  UpdateFeedbackRequest,
-} from 'generative-ai-use-cases-jp';
+  PiUserFill,
+  PiChalkboardTeacher,
+  PiFloppyDisk,
+  PiArrowClockwise,
+} from 'react-icons/pi';
+import { BaseProps } from '../@types/common';
+import { ShownMessage, UpdateFeedbackRequest } from 'generative-ai-use-cases';
 import BedrockIcon from '../assets/bedrock.svg?react';
 import useChat from '../hooks/useChat';
 import useTyping from '../hooks/useTyping';
-import useFileApi from '../hooks/useFileApi';
 import FileCard from './FileCard';
 import FeedbackForm from './FeedbackForm';
+import useFiles from '../hooks/useFiles';
+import { useTranslation } from 'react-i18next';
 
 type Props = BaseProps & {
   idx?: number;
@@ -26,9 +29,12 @@ type Props = BaseProps & {
   hideFeedback?: boolean;
   setSaveSystemContext?: (s: string) => void;
   setShowSystemContextModal?: (value: boolean) => void;
+  allowRetry?: boolean;
+  retryGeneration?: () => void;
 };
 
 const ChatMessage: React.FC<Props> = (props) => {
+  const { t } = useTranslation();
   const chatContent = useMemo(() => {
     return props.chatContent;
   }, [props]);
@@ -38,7 +44,7 @@ const ChatMessage: React.FC<Props> = (props) => {
   const [isSendingFeedback, setIsSendingFeedback] = useState(false);
   const [showFeedbackForm, setShowFeedbackForm] = useState(false);
   const [showThankYouMessage, setShowThankYouMessage] = useState(false);
-  const { getFileDownloadSignedUrl } = useFileApi();
+  const { getFileDownloadSignedUrl } = useFiles(pathname);
 
   const { setTypingTextInput, typingTextOutput } = useTyping(
     chatContent?.role === 'assistant' && props.loading
@@ -54,11 +60,15 @@ const ChatMessage: React.FC<Props> = (props) => {
 
   useEffect(() => {
     if (chatContent?.extraData) {
-      // ローディング表示にするために、画像の数だけ要素を用意して、undefinedを初期値として設定する
+      // To display the loading, prepare as many elements as the number of images, and set undefined as the initial value
       setSignedUrls(new Array(chatContent.extraData.length).fill(undefined));
       Promise.all(
         chatContent.extraData.map(async (file) => {
-          return await getFileDownloadSignedUrl(file.source.data);
+          if (file.source.type === 's3') {
+            return await getFileDownloadSignedUrl(file.source.data, true);
+          } else {
+            return file.source.data;
+          }
         })
       ).then((results) => setSignedUrls(results));
     } else {
@@ -91,7 +101,7 @@ const ChatMessage: React.FC<Props> = (props) => {
   };
 
   const handleFeedbackClick = (feedback: string) => {
-    // ボタン押した際、ユーザーからの詳細フィードバック前にDBに送る。
+    // When the button is pressed, send the detailed feedback from the user to the DB before it is displayed.
     onSendFeedback({
       createdDate: props.chatContent!.createdDate!,
       feedback: feedback,
@@ -155,7 +165,7 @@ const ChatMessage: React.FC<Props> = (props) => {
               <details className="mb-2 cursor-pointer rounded border p-2">
                 <summary className="text-sm">
                   <div className="inline-flex gap-1">
-                    トレース
+                    {t('common.trace')}
                     {props.loading && !chatContent?.content && (
                       <div className="border-aws-sky size-5 animate-spin rounded-full border-4 border-t-transparent"></div>
                     )}
@@ -166,7 +176,7 @@ const ChatMessage: React.FC<Props> = (props) => {
                 </Markdown>
               </details>
             )}
-            {chatContent?.extraData && (
+            {chatContent?.extraData && chatContent.extraData.length > 0 && (
               <div className="mb-2 flex flex-wrap gap-2">
                 {chatContent.extraData.map((data, idx) => {
                   if (data.type === 'image') {
@@ -197,11 +207,7 @@ const ChatMessage: React.FC<Props> = (props) => {
               </div>
             )}
             {chatContent?.role === 'user' && (
-              <div className="break-all">
-                {typingTextOutput.split('\n').map((c, idx) => (
-                  <div key={idx}>{c}</div>
-                ))}
-              </div>
+              <div className="whitespace-pre-wrap">{typingTextOutput}</div>
             )}
             {chatContent?.role === 'assistant' && (
               <Markdown prefix={`${props.idx}`}>
@@ -214,13 +220,10 @@ const ChatMessage: React.FC<Props> = (props) => {
               </Markdown>
             )}
             {chatContent?.role === 'system' && (
-              <div className="break-all">
-                {typingTextOutput.split('\n').map((c, idx) => (
-                  <div key={idx}>{c}</div>
-                ))}
-              </div>
+              <div className="whitespace-pre-wrap">{typingTextOutput}</div>
             )}
             {props.loading && (chatContent?.content ?? '') === '' && (
+              /* eslint-disable-next-line @shopify/jsx-no-hardcoded-content */
               <div className="animate-pulse">▍</div>
             )}
 
@@ -247,6 +250,13 @@ const ChatMessage: React.FC<Props> = (props) => {
             !props.loading &&
             !props.hideFeedback && (
               <>
+                {props.allowRetry && (
+                  <ButtonIcon
+                    className="mr-0.5 text-gray-400"
+                    onClick={() => props.retryGeneration?.()}>
+                    <PiArrowClockwise />
+                  </ButtonIcon>
+                )}
                 <ButtonCopy
                   className="mr-0.5 text-gray-400"
                   text={chatContent?.content || ''}
@@ -283,7 +293,7 @@ const ChatMessage: React.FC<Props> = (props) => {
           )}
           {showThankYouMessage && (
             <div className="mt-2 rounded-md bg-green-100 p-2 text-center text-green-700">
-              フィードバックを受け付けました。ありがとうございます。
+              {t('common.feedback_received')}
             </div>
           )}
         </div>

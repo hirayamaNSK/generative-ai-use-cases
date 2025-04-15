@@ -5,7 +5,10 @@ import {
   UseCaseInTable,
   UseCaseAsOutput,
   UseCaseContent,
-} from 'generative-ai-use-cases-jp';
+  ListUseCasesResponse,
+  ListFavoriteUseCasesResponse,
+  ListRecentlyUsedUseCasesResponse,
+} from 'generative-ai-use-cases';
 import {
   DeleteCommand,
   DynamoDBDocumentClient,
@@ -23,7 +26,16 @@ const USECASE_ID_INDEX_NAME: string = process.env.USECASE_ID_INDEX_NAME!;
 const dynamoDb = new DynamoDBClient({});
 const dynamoDbDocument = DynamoDBDocumentClient.from(dynamoDb);
 
-// useCaseId のユースケースを取得
+// Max number of recently used use cases
+// Actually, it becomes RECENTLY_USED_SAVE_LIMIT + 1 in some cases
+// See the updateRecentlyUsedUseCase function for details
+const RECENTLY_USED_SAVE_LIMIT = 100;
+
+const getUserIdFromKey = (key: string): string => {
+  return key.split('#').slice(1).join('#');
+};
+
+// Get use case by useCaseId
 const innerFindUseCaseByUseCaseId = async (
   useCaseId: string
 ): Promise<UseCaseInTable | null> => {
@@ -51,10 +63,14 @@ const innerFindUseCaseByUseCaseId = async (
   }
 };
 
-// userId のユースケース一覧を取得
+// Get use case list by userId
 const innerFindUseCasesByUserId = async (
-  userId: string
-): Promise<UseCaseInTable[]> => {
+  userId: string,
+  _exclusiveStartKey?: string
+): Promise<{ useCases: UseCaseInTable[]; lastEvaluatedKey?: string }> => {
+  const exclusiveStartKey = _exclusiveStartKey
+    ? JSON.parse(Buffer.from(_exclusiveStartKey, 'base64').toString())
+    : undefined;
   const useCasesInTable = await dynamoDbDocument.send(
     new QueryCommand({
       TableName: USECASE_TABLE_NAME,
@@ -69,13 +85,22 @@ const innerFindUseCasesByUserId = async (
         ':dataTypePrefix': 'useCase',
       },
       ScanIndexForward: false,
+      Limit: 30, // Number of my use cases per page
+      ExclusiveStartKey: exclusiveStartKey,
     })
   );
 
-  return (useCasesInTable.Items || []) as UseCaseInTable[];
+  return {
+    useCases: (useCasesInTable.Items || []) as UseCaseInTable[],
+    lastEvaluatedKey: useCasesInTable.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(useCasesInTable.LastEvaluatedKey)).toString(
+          'base64'
+        )
+      : undefined,
+  };
 };
 
-// useCaseId の配列からユースケース一覧を取得
+// Get use case list from useCaseId array
 const innerFindUseCasesByUseCaseIds = async (
   useCaseIds: string[]
 ): Promise<UseCaseInTable[]> => {
@@ -92,11 +117,10 @@ const innerFindUseCasesByUseCaseIds = async (
   return useCasesInTable;
 };
 
-// userId の特定のデータタイプ (お気に入り・利用履歴) 一覧を取得
+// Get list of specific data type (favorite, recently used) by userId (all)
 const innerFindCommonsByUserIdAndDataType = async (
   userId: string,
-  dataTypePrefix: string,
-  limit?: number
+  dataTypePrefix: string
 ): Promise<UseCaseCommon[]> => {
   const commons = await dynamoDbDocument.send(
     new QueryCommand({
@@ -111,7 +135,6 @@ const innerFindCommonsByUserIdAndDataType = async (
         ':id': `useCase#${userId}`,
         ':dataTypePrefix': dataTypePrefix,
       },
-      Limit: limit,
       ScanIndexForward: false,
     })
   );
@@ -119,7 +142,43 @@ const innerFindCommonsByUserIdAndDataType = async (
   return (commons.Items || []) as UseCaseCommon[];
 };
 
-// useCaseId に関連する全てのデータ (本体・お気に入り・利用履歴) 一覧を取得
+// Get list of specific data type (favorite, recently used) by userId (pagination supported)
+const innerFindCommonsByUserIdAndDataTypePagniation = async (
+  userId: string,
+  dataTypePrefix: string,
+  _exclusiveStartKey?: string
+): Promise<{ commons: UseCaseCommon[]; lastEvaluatedKey?: string }> => {
+  const exclusiveStartKey = _exclusiveStartKey
+    ? JSON.parse(Buffer.from(_exclusiveStartKey, 'base64').toString())
+    : undefined;
+  const commons = await dynamoDbDocument.send(
+    new QueryCommand({
+      TableName: USECASE_TABLE_NAME,
+      KeyConditionExpression:
+        '#id = :id and begins_with(#dataType, :dataTypePrefix)',
+      ExpressionAttributeNames: {
+        '#id': 'id',
+        '#dataType': 'dataType',
+      },
+      ExpressionAttributeValues: {
+        ':id': `useCase#${userId}`,
+        ':dataTypePrefix': dataTypePrefix,
+      },
+      ScanIndexForward: false,
+      Limit: 20, // Number of favorites/recently used per page
+      ExclusiveStartKey: exclusiveStartKey,
+    })
+  );
+
+  return {
+    commons: (commons.Items || []) as UseCaseCommon[],
+    lastEvaluatedKey: commons.LastEvaluatedKey
+      ? Buffer.from(JSON.stringify(commons.LastEvaluatedKey)).toString('base64')
+      : undefined,
+  };
+};
+
+// Get all data (body, favorite, recently used) related to useCaseId
 const innerFindCommonsByUseCaseId = async (
   useCaseId: string
 ): Promise<UseCaseCommon[]> => {
@@ -157,6 +216,7 @@ export const createUseCase = async (
     promptTemplate: content.promptTemplate,
     inputExamples: content.inputExamples,
     fixedModelId: content.fixedModelId,
+    fileUpload: content.fileUpload,
     isShared: false,
   };
 
@@ -184,10 +244,10 @@ export const getUseCase = async (
     return null;
   }
 
-  const isMyUseCase = useCaseInTable.id.split('#')[1] === userId;
+  const isMyUseCase = getUserIdFromKey(useCaseInTable.id) === userId;
   const isShared = useCaseInTable.isShared;
 
-  // 自分のユースケースではない & シェアされていないものは取得させない
+  // If it is not my use case and not shared, do not get it
   if (!isMyUseCase && !isShared) {
     return null;
   }
@@ -208,9 +268,11 @@ export const getUseCase = async (
 };
 
 export const listUseCases = async (
-  userId: string
-): Promise<UseCaseAsOutput[]> => {
-  const useCasesInTable = await innerFindUseCasesByUserId(userId);
+  userId: string,
+  exclusiveStartKey?: string
+): Promise<ListUseCasesResponse> => {
+  const { useCases: useCasesInTable, lastEvaluatedKey } =
+    await innerFindUseCasesByUserId(userId, exclusiveStartKey);
 
   const favorites = await innerFindCommonsByUserIdAndDataType(
     userId,
@@ -222,11 +284,14 @@ export const listUseCases = async (
     return {
       ...u,
       isFavorite: favoritesUseCaseIds.includes(u.useCaseId),
-      isMyUseCase: u.id.split('#')[1] === userId,
+      isMyUseCase: getUserIdFromKey(u.id) === userId,
     };
   });
 
-  return useCasesAsOutput;
+  return {
+    data: useCasesAsOutput,
+    lastEvaluatedKey,
+  };
 };
 
 export const updateUseCase = async (
@@ -243,9 +308,9 @@ export const updateUseCase = async (
     return;
   }
 
-  if (useCaseInTable.id.split('#')[1] !== userId) {
+  if (getUserIdFromKey(useCaseInTable.id) !== userId) {
     console.error(
-      `userId mismatch ${userId} vs ${useCaseInTable.id.split('#')[1]}`
+      `userId mismatch ${userId} vs ${getUserIdFromKey(useCaseInTable.id)}`
     );
     return;
   }
@@ -258,13 +323,14 @@ export const updateUseCase = async (
         dataType: useCaseInTable.dataType,
       },
       UpdateExpression:
-        'set title = :title, promptTemplate = :promptTemplate, description = :description, inputExamples = :inputExamples, fixedModelId = :fixedModelId',
+        'set title = :title, promptTemplate = :promptTemplate, description = :description, inputExamples = :inputExamples, fixedModelId = :fixedModelId, fileUpload = :fileUpload',
       ExpressionAttributeValues: {
         ':title': content.title,
         ':promptTemplate': content.promptTemplate,
         ':description': content.description ?? '',
         ':inputExamples': content.inputExamples ?? [],
         ':fixedModelId': content.fixedModelId ?? '',
+        ':fileUpload': !!content.fileUpload,
       },
     })
   );
@@ -283,9 +349,9 @@ export const deleteUseCase = async (
     return;
   }
 
-  if (useCaseInTable.id.split('#')[1] !== userId) {
+  if (getUserIdFromKey(useCaseInTable.id) !== userId) {
     console.error(
-      `userId mismatch ${userId} vs ${useCaseInTable.id.split('#')[1]}`
+      `userId mismatch ${userId} vs ${getUserIdFromKey(useCaseInTable.id)}`
     );
     return;
   }
@@ -302,7 +368,7 @@ export const deleteUseCase = async (
     };
   });
 
-  // 本体・お気に入り・利用履歴をまとめて削除
+  // Delete body, favorite, recently used at once
   await dynamoDbDocument.send(
     new BatchWriteCommand({
       RequestItems: {
@@ -313,39 +379,48 @@ export const deleteUseCase = async (
 };
 
 export const listFavoriteUseCases = async (
-  userId: string
-): Promise<UseCaseAsOutput[]> => {
-  const commons = await innerFindCommonsByUserIdAndDataType(userId, 'favorite');
+  userId: string,
+  exclusiveStartKey?: string
+): Promise<ListFavoriteUseCasesResponse> => {
+  const { commons, lastEvaluatedKey } =
+    await innerFindCommonsByUserIdAndDataTypePagniation(
+      userId,
+      'favorite',
+      exclusiveStartKey
+    );
   const useCaseIds = commons.map((c) => c.useCaseId);
   const useCasesInTable = await innerFindUseCasesByUseCaseIds(useCaseIds);
   const useCasesAsOutput: UseCaseAsOutput[] = useCasesInTable.map((u) => {
     return {
       ...u,
       isFavorite: true,
-      isMyUseCase: u.id.split('#')[1] === userId,
+      isMyUseCase: getUserIdFromKey(u.id) === userId,
     };
   });
 
-  // 自分のもの or シェアされているもののみ
+  // My use case or shared
   const useCasesAsOutputFiltered = useCasesAsOutput.filter((u) => {
     return u.isMyUseCase || u.isShared;
   });
 
-  return useCasesAsOutputFiltered;
+  return {
+    data: useCasesAsOutputFiltered,
+    lastEvaluatedKey,
+  };
 };
 
 export const toggleFavorite = async (
   userId: string,
   useCaseId: string
 ): Promise<IsFavorite> => {
-  // 自分のお気に入り一覧を取得してすでに登録されているかを確認する
-  // MEMO: お気に入りの数が膨大になった場合リストから溢れる可能性あり
+  // Get my favorite list and check if it is already registered
+  // MEMO: If the number of favorites is large, it may overflow from the list
   const commons = await innerFindCommonsByUserIdAndDataType(userId, 'favorite');
   const useCaseIds = commons.map((c) => c.useCaseId);
   const index = useCaseIds.indexOf(useCaseId);
 
   if (index >= 0) {
-    // お気に入りを解除
+    // Unfavorite
     const common = commons[index];
 
     await dynamoDbDocument.send(
@@ -360,7 +435,7 @@ export const toggleFavorite = async (
 
     return { isFavorite: false };
   } else {
-    // お気に入りに登録
+    // Register favorite
     await dynamoDbDocument.send(
       new PutCommand({
         TableName: USECASE_TABLE_NAME,
@@ -389,9 +464,9 @@ export const toggleShared = async (
     return { isShared: false };
   }
 
-  if (useCaseInTable.id.split('#')[1] !== userId) {
+  if (getUserIdFromKey(useCaseInTable.id) !== userId) {
     console.error(
-      `userId mismatch ${userId} vs ${useCaseInTable.id.split('#')[1]}`
+      `userId mismatch ${userId} vs ${getUserIdFromKey(useCaseInTable.id)}`
     );
     return { isShared: false };
   }
@@ -414,13 +489,15 @@ export const toggleShared = async (
 };
 
 export const listRecentlyUsedUseCases = async (
-  userId: string
-): Promise<UseCaseAsOutput[]> => {
-  const commons = await innerFindCommonsByUserIdAndDataType(
-    userId,
-    'recentlyUsed',
-    15
-  );
+  userId: string,
+  exclusiveStartKey?: string
+): Promise<ListRecentlyUsedUseCasesResponse> => {
+  const { commons, lastEvaluatedKey } =
+    await innerFindCommonsByUserIdAndDataTypePagniation(
+      userId,
+      'recentlyUsed',
+      exclusiveStartKey
+    );
   const useCaseIds = commons.map((c) => c.useCaseId);
   const useCasesInTable = await innerFindUseCasesByUseCaseIds(useCaseIds);
 
@@ -434,67 +511,73 @@ export const listRecentlyUsedUseCases = async (
     return {
       ...u,
       isFavorite: favoritesUseCaseIds.includes(u.useCaseId),
-      isMyUseCase: u.id.split('#')[1] === userId,
+      isMyUseCase: getUserIdFromKey(u.id) === userId,
     };
   });
 
-  // 自分のもの or シェアされているもののみ
+  // Own or shared
   const useCasesAsOutputFiltered = useCasesAsOutput.filter((u) => {
     return u.isMyUseCase || u.isShared;
   });
 
-  return useCasesAsOutputFiltered;
+  return {
+    data: useCasesAsOutputFiltered,
+    lastEvaluatedKey,
+  };
 };
 
 export const updateRecentlyUsedUseCase = async (
   userId: string,
   useCaseId: string
 ): Promise<void> => {
+  const itemsToDelete: UseCaseCommon[] = [];
+
+  // Scan is running for recently used use case data
   const commons = await innerFindCommonsByUserIdAndDataType(
     userId,
     'recentlyUsed'
   );
+
+  // Max number of recently used use cases
+  if (commons.length > RECENTLY_USED_SAVE_LIMIT) {
+    itemsToDelete.push(...commons.slice(RECENTLY_USED_SAVE_LIMIT));
+  }
+
   const useCaseIds = commons.map((c) => c.useCaseId);
   const index = useCaseIds.indexOf(useCaseId);
 
-  if (index >= 0) {
-    // 削除と追加を同時に
-    await dynamoDbDocument.send(
-      new TransactWriteCommand({
-        TransactItems: [
-          {
+  // If there is an older history for the same use case, it is a deletion target
+  if (0 <= index && index <= RECENTLY_USED_SAVE_LIMIT - 1) {
+    itemsToDelete.push(commons[index]);
+  }
+
+  // Delete and add at the same time
+  // If a new history is added (no existing history), the number of histories will be RECENTLY_USED_SAVE_LIMIT + 1, but this is acceptable
+  await dynamoDbDocument.send(
+    new TransactWriteCommand({
+      TransactItems: [
+        ...itemsToDelete.map((item: UseCaseCommon) => {
+          return {
             Delete: {
               TableName: USECASE_TABLE_NAME,
               Key: {
-                id: commons[index].id,
-                dataType: commons[index].dataType,
+                id: item.id,
+                dataType: item.dataType,
               },
             },
-          },
-          {
-            Put: {
-              TableName: USECASE_TABLE_NAME,
-              Item: {
-                id: `useCase#${userId}`,
-                dataType: `recentlyUsed#${Date.now()}`,
-                useCaseId,
-              },
+          };
+        }),
+        {
+          Put: {
+            TableName: USECASE_TABLE_NAME,
+            Item: {
+              id: `useCase#${userId}`,
+              dataType: `recentlyUsed#${Date.now()}`,
+              useCaseId,
             },
           },
-        ],
-      })
-    );
-  } else {
-    // 追加のみ
-    await dynamoDbDocument.send(
-      new PutCommand({
-        TableName: USECASE_TABLE_NAME,
-        Item: {
-          id: `useCase#${userId}`,
-          dataType: `recentlyUsed#${Date.now()}`,
-          useCaseId,
         },
-      })
-    );
-  }
+      ],
+    })
+  );
 };

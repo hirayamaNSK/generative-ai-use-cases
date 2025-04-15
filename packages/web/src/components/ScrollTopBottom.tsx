@@ -8,21 +8,21 @@ type Props = BaseProps;
 const ScrollTopBottom: React.FC<Props> = (props) => {
   const { isAtBottom, isAtTop, scrollToBottom, scrollToTop } = useScreen();
 
-  // 最下部までスクロールが可能かどうか
-  // すでに到達している場合は不可
+  // Whether it is possible to scroll to the bottom
+  // If already reached, it is not possible
   const scrollToBottomAvailable = useMemo(() => {
     return !isAtBottom;
   }, [isAtBottom]);
 
-  // 最上部までスクロール可能かどうか
-  // すでに到達している場合は不可
+  // Whether it is possible to scroll to the top
+  // If already reached, it is not possible
   const scrollToTopAvailable = useMemo(() => {
     return !isAtTop;
   }, [isAtTop]);
 
   return (
     <div
-      className={`flex w-fit flex-col text-2xl text-white ${!scrollToTopAvailable && !scrollToBottomAvailable ? 'hidden' : ''} ${props.className ?? ''}`}>
+      className={`flex w-fit flex-col text-2xl text-white ${!scrollToTopAvailable && !scrollToBottomAvailable ? 'hidden' : ''} ${props.className ?? ''} print:hidden`}>
       <button
         className={`flex h-8 w-8 items-center justify-center rounded-t bg-gray-400 ${scrollToTopAvailable ? 'opacity-80' : 'opacity-30'}`}
         onClick={scrollToTop}

@@ -6,7 +6,6 @@ import useVersion from '../hooks/useVersion';
 import IconWithDot from './IconWithDot';
 import { PiGear } from 'react-icons/pi';
 import { fetchAuthSession } from 'aws-amplify/auth';
-import { ROUTE_INDEX_USE_CASE_BUILDER } from '../main';
 
 type Props = BaseProps & {
   builderMode?: boolean;
@@ -16,7 +15,7 @@ type Props = BaseProps & {
 const DrawerBase: React.FC<Props> = (props) => {
   const { getHasUpdate } = useVersion();
 
-  // 第一引数は不要だが、ないとリクエストされないため 'user' 文字列を入れる
+  // The first argument is not required, but if it is not included, the request will not be made, so 'user' string is entered
   const { data } = useSWR('user', () => {
     return fetchAuthSession();
   });
@@ -28,9 +27,7 @@ const DrawerBase: React.FC<Props> = (props) => {
   const hasUpdate = getHasUpdate();
 
   const settingUrl = useMemo(() => {
-    return props.builderMode
-      ? `${ROUTE_INDEX_USE_CASE_BUILDER}/setting`
-      : 'setting';
+    return props.builderMode ? `/use-case-builder/setting` : 'setting';
   }, [props.builderMode]);
 
   return (
