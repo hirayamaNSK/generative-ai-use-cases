@@ -93,42 +93,46 @@ export const hiddenStaticExplicitFilters: RetrievalFilter[] = [
 // The sample file (packages/cdk/rag-docs/docs) defines the metadata.json accordingly.
 export const userDefinedExplicitFilters: ExplicitFilterConfiguration[] = [
   // Example 1: Filter by category (string match)
-  {
-    key: 'category',
-    type: 'STRING',
-    options: [{ value: 'AWS', label: 'AWS' }],
-    description: 'Category',
-  },
+//  {
+//    key: 'Product',
+//    type: 'STRING',
+//    options: [
+//	    { value: 'Bearing', label: '軸受' },
+//            { value: 'seiki'  , label: '精機' },
+//	    { value: 'Spacia' , label: 'スペーシア' },
+//    ],
+//    description: 'Product',
+//  },
 
   // Example 2: Filter by tag (string list)
-  {
-    key: 'tag',
-    type: 'STRING_LIST',
-    options: [
-      { value: 'AWS', label: 'AWS' },
-      { value: 'Amazon Bedrock', label: 'Amazon Bedrock' },
-      { value: 'Amazon SageMaker', label: 'Amazon SageMaker' },
-    ],
-    description: 'Tag',
-  },
+//  {
+//    key: 'tag',
+//    type: 'STRING_LIST',
+//    options: [
+//      { value: 'AWS', label: 'AWS' },
+//      { value: 'Amazon Bedrock', label: 'Amazon Bedrock' },
+//      { value: 'Amazon SageMaker', label: 'Amazon SageMaker' },
+//    ],
+//    description: 'Tag',
+//  },
 
   // Example 3: Filter by year (number)
-  {
-    key: 'year',
-    type: 'NUMBER',
-    description: 'Year',
-  },
+//  {
+//    key: 'year',
+//    type: 'NUMBER',
+//    description: 'Year',
+//  },
 
   // Example 4: Filter by is_public (boolean)
-  {
-    key: 'is_public',
-    type: 'BOOLEAN',
-    options: [
-      { value: 'true', label: 'Public' },
-      { value: 'false', label: 'Private' },
-    ],
-    description: 'Public',
-  },
+//  {
+//    key: 'is_public',
+//    type: 'BOOLEAN',
+//    options: [
+//      { value: 'true', label: 'Public' },
+//      { value: 'false', label: 'Private' },
+//    ],
+//    description: 'Public',
+//  },
 
   // Customize Here
 ];

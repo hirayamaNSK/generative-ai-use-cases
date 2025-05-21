@@ -1,9 +1,7 @@
 {
   "metadataAttributes": {
-    "group": ["IT"],
-    "year": 2024,
-    "tag": ["AWS", "Amazon Bedrock"],
-    "category": "AWS",
+    "Product": ["Bearing","seiki","Spacia"],
+    "is_general": true,
     "is_public": true,
     "title": "Amazon Bedrock User Guide"
   }

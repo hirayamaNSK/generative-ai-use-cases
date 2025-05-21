@@ -26,7 +26,7 @@
     "ragKnowledgeBaseEnabled": true,
     "ragKnowledgeBaseId": null,
     "ragKnowledgeBaseStandbyReplicas": false,
-    "ragKnowledgeBaseAdvancedParsing": false,
+    "ragKnowledgeBaseAdvancedParsing": true,
     "ragKnowledgeBaseAdvancedParsingModelId": "anthropic.claude-3-sonnet-20240229-v1:0",
     "ragKnowledgeBaseBinaryVector": false,
     "embeddingModelId": "amazon.titan-embed-text-v2:0",
