@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    // 【重要】ソースファイル（.ts）は src ディレクトリにある
+    "rootDir": "./src",
+    // 【重要】型定義ファイル（.d.ts）を生成する
+    "declaration": true,
+    // 実際にコンパイルされたファイルを出力するディレクトリ（型定義ファイルもここに出る）
+    "outDir": "./lib", 
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "moduleResolution": "node"
+  },
+  // コンパイル対象として src/ ディレクトリ以下のすべてのファイルを含める
+  "include": ["src/**/*"] 
+}
